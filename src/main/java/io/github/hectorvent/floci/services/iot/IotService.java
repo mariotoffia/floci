@@ -63,6 +63,10 @@ public class IotService {
     static final String DEFAULT_ENDPOINT_TYPE = "iot:Data-ATS";
 
     private static final Pattern THING_NAME_PATTERN = Pattern.compile("[a-zA-Z0-9:_-]{1,128}");
+    public static final int MAX_POLICY_VERSIONS = 5;
+
+    /** One lock for every policy version write and the policy delete, so a cap check, an append and a delete cannot interleave. */
+    private final Object policyWriteLock = new Object();
 
     private final StorageBackend<String, Thing> thingStore;
     private final StorageBackend<String, IotCertificate> certificateStore;
@@ -371,34 +375,42 @@ public class IotService {
     }
 
     public void deletePolicy(String policyName, String region) {
-        getPolicy(policyName, region);
-        if (!policyAttachmentStore.get(policyAttachmentKey(region, policyName)).orElse(Set.of()).isEmpty()) {
-            throw new AwsException("InvalidRequestException", "Cannot delete attached policy", 400);
+        synchronized (policyWriteLock) {
+            getPolicy(policyName, region);
+            if (!policyAttachmentStore.get(policyAttachmentKey(region, policyName)).orElse(Set.of()).isEmpty()) {
+                throw new AwsException("InvalidRequestException", "Cannot delete attached policy", 400);
+            }
+            policyStore.delete(policyKey(region, policyName));
+            policyAttachmentStore.delete(policyAttachmentKey(region, policyName));
         }
-        policyStore.delete(policyKey(region, policyName));
-        policyAttachmentStore.delete(policyAttachmentKey(region, policyName));
     }
 
     public IotPolicy.PolicyVersion createPolicyVersion(String policyName, String policyDocument, boolean setAsDefault, String region) {
-        IotPolicy policy = getPolicy(policyName, region);
-        int next = policy.getVersions().stream()
-                .map(IotPolicy.PolicyVersion::getVersionId)
-                .mapToInt(Integer::parseInt)
-                .max()
-                .orElse(0) + 1;
-        IotPolicy.PolicyVersion version = new IotPolicy.PolicyVersion();
-        version.setVersionId(Integer.toString(next));
-        version.setDocument(policyDocument);
-        version.setCreateDate(Instant.now());
-        List<IotPolicy.PolicyVersion> versions = new java.util.ArrayList<>(policy.getVersions());
-        versions.add(version);
-        policy.setVersions(versions);
-        if (setAsDefault) {
-            policy.setDefaultVersionId(version.getVersionId());
-            policy.setPolicyDocument(policyDocument);
+        synchronized (policyWriteLock) {
+            IotPolicy policy = getPolicy(policyName, region);
+            if (policy.getVersions().size() >= MAX_POLICY_VERSIONS) {
+                throw new AwsException("VersionsLimitExceededException", "The policy " + policyName
+                        + " already has the maximum number of versions (" + MAX_POLICY_VERSIONS + ")", 409);
+            }
+            int next = policy.getVersions().stream()
+                    .map(IotPolicy.PolicyVersion::getVersionId)
+                    .mapToInt(Integer::parseInt)
+                    .max()
+                    .orElse(0) + 1;
+            IotPolicy.PolicyVersion version = new IotPolicy.PolicyVersion();
+            version.setVersionId(Integer.toString(next));
+            version.setDocument(policyDocument);
+            version.setCreateDate(Instant.now());
+            List<IotPolicy.PolicyVersion> versions = new ArrayList<>(policy.getVersions());
+            versions.add(version);
+            policy.setVersions(versions);
+            if (setAsDefault) {
+                policy.setDefaultVersionId(version.getVersionId());
+                policy.setPolicyDocument(policyDocument);
+            }
+            policyStore.put(policyKey(region, policyName), policy);
+            return version;
         }
-        policyStore.put(policyKey(region, policyName), policy);
-        return version;
     }
 
     public IotPolicy.PolicyVersion getPolicyVersion(String policyName, String versionId, String region) {
@@ -416,26 +428,55 @@ public class IotService {
     }
 
     public void setDefaultPolicyVersion(String policyName, String versionId, String region) {
-        IotPolicy policy = getPolicy(policyName, region);
-        IotPolicy.PolicyVersion version = getPolicyVersion(policyName, versionId, region);
-        policy.setDefaultVersionId(versionId);
-        policy.setPolicyDocument(version.getDocument());
-        policyStore.put(policyKey(region, policyName), policy);
+        synchronized (policyWriteLock) {
+            IotPolicy policy = getPolicy(policyName, region);
+            IotPolicy.PolicyVersion version = getPolicyVersion(policyName, versionId, region);
+            policy.setDefaultVersionId(versionId);
+            policy.setPolicyDocument(version.getDocument());
+            policyStore.put(policyKey(region, policyName), policy);
+        }
     }
 
     public void deletePolicyVersion(String policyName, String versionId, String region) {
-        IotPolicy policy = getPolicy(policyName, region);
-        if (versionId.equals(policy.getDefaultVersionId())) {
-            throw new AwsException("InvalidRequestException", "Cannot delete default policy version", 400);
+        synchronized (policyWriteLock) {
+            IotPolicy policy = getPolicy(policyName, region);
+            if (versionId.equals(policy.getDefaultVersionId())) {
+                throw new AwsException("InvalidRequestException", "Cannot delete default policy version", 400);
+            }
+            List<IotPolicy.PolicyVersion> versions = policy.getVersions().stream()
+                    .filter(version -> !versionId.equals(version.getVersionId()))
+                    .toList();
+            if (versions.size() == policy.getVersions().size()) {
+                throw new AwsException("ResourceNotFoundException", "Policy version not found: " + versionId, 404);
+            }
+            policy.setVersions(versions);
+            policyStore.put(policyKey(region, policyName), policy);
         }
-        List<IotPolicy.PolicyVersion> versions = policy.getVersions().stream()
-                .filter(version -> !versionId.equals(version.getVersionId()))
-                .toList();
-        if (versions.size() == policy.getVersions().size()) {
-            throw new AwsException("ResourceNotFoundException", "Policy version not found: " + versionId, 404);
+    }
+
+    /**
+     * Deletes the oldest versions until one more fits under the cap, which is what the AWS
+     * CloudFormation handler means to do once the service refuses a sixth (it sorts version ids as
+     * text, so past nine it picks another one). A policy persisted before the cap can hold more
+     * than five, so this deletes as many as it takes. A default version cannot be deleted, so when
+     * the oldest is the default the newest becomes the default first. One step under the policy
+     * write lock, so nothing else can move the selection in between.
+     */
+    public void makeRoomForPolicyVersion(String policyName, String region) {
+        synchronized (policyWriteLock) {
+            IotPolicy policy = getPolicy(policyName, region);
+            while (policy.getVersions().size() >= MAX_POLICY_VERSIONS) {
+                List<IotPolicy.PolicyVersion> versions = policy.getVersions().stream()
+                        .sorted(Comparator.comparingInt(version -> Integer.parseInt(version.getVersionId())))
+                        .toList();
+                String oldest = versions.get(0).getVersionId();
+                if (oldest.equals(policy.getDefaultVersionId())) {
+                    setDefaultPolicyVersion(policyName, versions.get(versions.size() - 1).getVersionId(), region);
+                }
+                deletePolicyVersion(policyName, oldest, region);
+                policy = getPolicy(policyName, region);
+            }
         }
-        policy.setVersions(versions);
-        policyStore.put(policyKey(region, policyName), policy);
     }
 
     public void attachPolicy(String policyName, String target, String region) {
