@@ -63,7 +63,7 @@ public class IotService {
     static final String DEFAULT_ENDPOINT_TYPE = "iot:Data-ATS";
 
     private static final Pattern THING_NAME_PATTERN = Pattern.compile("[a-zA-Z0-9:_-]{1,128}");
-    static final int MAX_POLICY_VERSIONS = 5;
+    public static final int MAX_POLICY_VERSIONS = 5;
 
     /** One lock for every policy version write, so the cap check and the append cannot interleave. */
     private final Object policyVersionLock = new Object();
