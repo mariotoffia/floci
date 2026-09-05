@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cognito;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.TlsCertificateManager;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ReservedTags;
@@ -1392,7 +1393,8 @@ class CognitoServiceTest {
                 regionResolver,
                 null,
                 verificationCodeService,
-                messageDispatcher
+                messageDispatcher,
+                mock(TlsCertificateManager.class)
         );
 
         UserPool pool = serviceWithVerification.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
@@ -1431,7 +1433,8 @@ class CognitoServiceTest {
                 regionResolver,
                 null,
                 verificationCodeService,
-                messageDispatcher
+                messageDispatcher,
+                mock(TlsCertificateManager.class)
         );
 
         UserPool pool = serviceWithVerification.createUserPool(Map.of("PoolName", "TestPool"), "us-east-1");
@@ -2901,7 +2904,8 @@ class CognitoServiceTest {
                     regionResolver,
                     null,
                     verificationCodeService,
-                    messageDispatcher
+                    messageDispatcher,
+                    mock(TlsCertificateManager.class)
             );
         }
     }
