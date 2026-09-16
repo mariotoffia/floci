@@ -30,6 +30,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 
 @ApplicationScoped
@@ -59,12 +61,7 @@ public class SqsService implements Resettable, ResourceProvider {
             new ConcurrentHashMap<>();
     /** Move tasks execute on a background thread so MaxNumberOfMessagesPerSecond can throttle
      * and CancelMessageMoveTask has something to interrupt. One thread per task is sufficient. */
-    private final java.util.concurrent.ExecutorService moveTaskExecutor =
-            java.util.concurrent.Executors.newCachedThreadPool(r -> {
-                Thread t = new Thread(r, "sqs-move-task");
-                t.setDaemon(true);
-                return t;
-            });
+    private final ExecutorService moveTaskExecutor;
     private final AtomicLong sequenceCounter = new AtomicLong(0);
     private static final HexFormat HEX = HexFormat.of();
 
@@ -230,6 +227,20 @@ public class SqsService implements Resettable, ResourceProvider {
                int defaultVisibilityTimeout, int maxMessageSize, String baseUrl,
                RegionResolver regionResolver, boolean clearFifoDeduplicationCacheOnPurge,
                SnsService snsService, Clock clock) {
+        this(queueStore, messageStore, dedupStore, defaultVisibilityTimeout, maxMessageSize, baseUrl,
+                regionResolver, clearFifoDeduplicationCacheOnPurge, snsService, clock,
+                Executors.newCachedThreadPool(runnable -> {
+                    Thread thread = new Thread(runnable, "sqs-move-task");
+                    thread.setDaemon(true);
+                    return thread;
+                }));
+    }
+
+    SqsService(StorageBackend<String, Queue> queueStore, StorageBackend<String, List<Message>> messageStore,
+               StorageBackend<String, Map<String, Long>> dedupStore,
+               int defaultVisibilityTimeout, int maxMessageSize, String baseUrl,
+               RegionResolver regionResolver, boolean clearFifoDeduplicationCacheOnPurge,
+               SnsService snsService, Clock clock, ExecutorService moveTaskExecutor) {
         this.queueStore = queueStore;
         this.messageStore = messageStore;
         this.dedupStore = dedupStore;
@@ -241,6 +252,7 @@ public class SqsService implements Resettable, ResourceProvider {
         this.clearFifoDeduplicationCacheOnPurge = clearFifoDeduplicationCacheOnPurge;
         this.snsService = snsService;
         this.clock = clock;
+        this.moveTaskExecutor = Objects.requireNonNull(moveTaskExecutor);
         this.moveTasksByHandle = new MoveTaskStore(clock);
         loadPersistedMessages();
         loadPersistedDedup();

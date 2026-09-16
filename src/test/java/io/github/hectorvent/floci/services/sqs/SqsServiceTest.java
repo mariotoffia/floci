@@ -17,15 +17,20 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -1288,7 +1293,8 @@ class SqsServiceTest {
     }
 
     @Test
-    void cancelMessageMoveTask_knownHandle_stopsBackgroundWorker() throws Exception {
+    void cancelMessageMoveTask_knownHandle_stopsQueuedWorker() throws Exception {
+        Deque<FutureTask<Void>> workers = controlledMoveWorkers();
         Queue dlq = sqsService.createQueue("d", null, "us-east-1");
         String dlqArn = queueArn("d");
         sqsService.createQueue("p",
@@ -1297,8 +1303,7 @@ class SqsServiceTest {
         sqsService.createQueue("dest", null, "us-east-1");
         String destArn = queueArn("dest");
 
-        // Load enough messages that, at the throttled rate, the worker can't possibly
-        // drain the queue before cancel is observed.
+        // Keep the source populated after the synchronous first move; release the worker only after cancellation.
         for (int i = 0; i < 50; i++) {
             sqsService.sendMessage(dlq.getQueueUrl(), "msg-" + i, 0, null, null, "us-east-1");
         }
@@ -1306,7 +1311,8 @@ class SqsServiceTest {
         String taskHandle = sqsService.startMessageMoveTask(dlqArn, destArn, 1, "us-east-1");
         assertEquals(1, sqsService.cancelMessageMoveTask(taskHandle, "us-east-1"));
 
-        awaitMoveTaskStatus(dlqArn, taskHandle, "CANCELLED");
+        finishCancelledMove(workers, dlqArn, taskHandle);
+        assertTrue(workers.isEmpty());
     }
 
     @Test
@@ -1383,6 +1389,7 @@ class SqsServiceTest {
 
     @Test
     void cancelledMessageMoveTasks_areBoundedAndAllowTheNextTask() throws Exception {
+        Deque<FutureTask<Void>> workers = controlledMoveWorkers();
         Queue dlq = sqsService.createQueue("cancel-cap-dlq", null, "us-east-1");
         String dlqArn = queueArn("cancel-cap-dlq");
         sqsService.createQueue("cancel-cap-source",
@@ -1400,7 +1407,7 @@ class SqsServiceTest {
             String taskHandle = sqsService.startMessageMoveTask(dlqArn, destinationArn, 1, "us-east-1");
             taskHandles.add(taskHandle);
             sqsService.cancelMessageMoveTask(taskHandle, "us-east-1");
-            awaitMoveTaskStatus(dlqArn, taskHandle, "CANCELLED");
+            finishCancelledMove(workers, dlqArn, taskHandle);
             if (i < 10) {
                 clock.advance(Duration.ofSeconds(2));
             }
@@ -1413,10 +1420,34 @@ class SqsServiceTest {
         clock.advance(Duration.ofSeconds(2));
         String nextTask = sqsService.startMessageMoveTask(dlqArn, destinationArn, 1, "us-east-1");
         sqsService.cancelMessageMoveTask(nextTask, "us-east-1");
-        awaitMoveTaskStatus(dlqArn, nextTask, "CANCELLED");
+        finishCancelledMove(workers, dlqArn, nextTask);
+        assertTrue(workers.isEmpty(), "every accepted task ran its real cancellation finalizer");
 
         clock.advance(Duration.ofHours(1).plusMillis(1));
         assertTrue(sqsService.listMessageMoveTasks(dlqArn, "us-east-1").isEmpty());
+    }
+
+    private Deque<FutureTask<Void>> controlledMoveWorkers() {
+        Deque<FutureTask<Void>> workers = new ArrayDeque<>();
+        ExecutorService executor = mock(ExecutorService.class);
+        when(executor.submit(any(Runnable.class))).thenAnswer(invocation -> {
+            FutureTask<Void> worker = new FutureTask<>(invocation.getArgument(0), null);
+            workers.addLast(worker);
+            return worker;
+        });
+        sqsService.stop();
+        sqsService = new SqsService(new InMemoryStorage<>(), null, null, 30, 1048576, BASE_URL,
+                new RegionResolver("us-east-1", "000000000000"), false, null, clock, executor);
+        return workers;
+    }
+
+    private void finishCancelledMove(Deque<FutureTask<Void>> workers, String sourceArn, String taskHandle)
+            throws Exception {
+        FutureTask<Void> worker = workers.removeFirst();
+        worker.run();
+        worker.get(1, TimeUnit.SECONDS);
+        assertEquals("CANCELLED", sqsService.listMessageMoveTasks(sourceArn, "us-east-1").stream()
+                .filter(task -> task.taskHandle().equals(taskHandle)).findFirst().orElseThrow().status());
     }
 
     private void awaitMoveTaskStatus(String sourceArn, String taskHandle, String expectedStatus) throws Exception {
