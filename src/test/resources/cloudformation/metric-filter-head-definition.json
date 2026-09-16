@@ -1,0 +1,24 @@
+{
+  "region": "us-east-1",
+  "logGroupName": "/cfn/head-snapshot-migration",
+  "filterName": "legacy|count",
+  "definition": {
+    "filterName": "legacy|count",
+    "logGroupName": "/cfn/head-snapshot-migration",
+    "filterPattern": "WARN",
+    "metricTransformations": [
+      {
+        "metricName": "Count",
+        "metricNamespace": "Legacy/Baseline",
+        "metricValue": "2",
+        "defaultValue": 7.0,
+        "dimensions": {},
+        "unit": "Count"
+      }
+    ],
+    "creationTime": 1000,
+    "applyOnTransformedLogs": false,
+    "fieldSelectionCriteria": null,
+    "emitSystemFieldDimensions": null
+  }
+}

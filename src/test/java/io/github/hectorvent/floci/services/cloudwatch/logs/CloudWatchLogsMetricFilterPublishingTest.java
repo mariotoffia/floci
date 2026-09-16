@@ -1,368 +1,225 @@
 package io.github.hectorvent.floci.services.cloudwatch.logs;
 
-import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
-import io.github.hectorvent.floci.core.storage.InMemoryStorage;
-import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogEvent;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.MetricFilter;
-import io.github.hectorvent.floci.services.cloudwatch.logs.model.MetricTransformation;
-import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
-import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyList;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.ArgumentMatchers.isNull;
-import static org.mockito.Mockito.atLeastOnce;
-import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.verify;
+import static io.github.hectorvent.floci.services.cloudwatch.logs.PublicationTestSupport.*;
+import static org.junit.jupiter.api.Assertions.*;
 
-/**
- * The metrics a filter publishes for a stored batch: one value per matching event at the event's
- * time, the literal value or the field it names, dimensions from the event's fields, the default
- * value once when nothing matched, and a failing filter never stopping the others.
- */
+/** AWS observations are input data, never regenerated from emulator output. */
 class CloudWatchLogsMetricFilterPublishingTest {
-
-    private static final String REGION = "us-east-1";
-    private static final String GROUP = "/app/api";
-    private static final String OTHER_GROUP = "/app/worker";
-
-    private CloudWatchMetricsService metrics;
-    private CloudWatchLogsMetricFilterService service;
+    private static final ObjectMapper JSON = new ObjectMapper();
+    private PublicationTestSupport f;
 
     @BeforeEach
-    void setUp() {
-        RegionResolver resolver = new RegionResolver(REGION, "000000000000");
-        CloudWatchLogsService logs = new CloudWatchLogsService(new InMemoryStorage<>(), new InMemoryStorage<>(),
-                new InMemoryStorage<>(), new InMemoryStorage<>(), 10_000, resolver);
-        logs.createLogGroup(GROUP, null, null, REGION);
-        logs.createLogGroup(OTHER_GROUP, null, null, REGION);
-        metrics = mock(CloudWatchMetricsService.class);
-        service = new CloudWatchLogsMetricFilterService(new InMemoryStorage<>(), logs, metrics, resolver);
-    }
+    void setUp() { f = new PublicationTestSupport(); }
 
-    private static MetricTransformation transformation(String name, String namespace, String value) {
-        MetricTransformation t = new MetricTransformation();
-        t.setMetricName(name);
-        t.setMetricNamespace(namespace);
-        t.setMetricValue(value);
-        return t;
-    }
-
-    private static MetricFilter filter(String group, String name, String pattern, MetricTransformation transformation) {
-        MetricFilter filter = new MetricFilter();
-        filter.setLogGroupName(group);
-        filter.setFilterName(name);
-        filter.setFilterPattern(pattern);
-        filter.setMetricTransformations(List.of(transformation));
-        return filter;
-    }
-
-    private static MetricFilter errorCounter(String group, String name) {
-        return filter(group, name, "ERROR", transformation("ErrorCount", "App", "1"));
-    }
-
-    private static LogEvent event(long timestamp, String message) {
-        LogEvent event = new LogEvent();
-        event.setEventId(String.valueOf(timestamp));
-        event.setTimestamp(timestamp);
-        event.setMessage(message);
-        event.setIngestionTime(timestamp);
-        return event;
-    }
-
-    private List<MetricDatum> published(String namespace) {
-        return published(null, namespace);
-    }
-
-    /** Every datum published across the calls a test made, for the tests that send several batches. */
-    private List<MetricDatum> allPublished(String namespace) {
-        ArgumentCaptor<List<MetricDatum>> datums = ArgumentCaptor.captor();
-        verify(metrics, atLeastOnce()).putMetricDataForAccount(isNull(), eq(namespace), datums.capture(), eq(REGION));
-        return datums.getAllValues().stream().flatMap(List::stream).toList();
-    }
-
-    private List<MetricDatum> published(String accountId, String namespace) {
-        ArgumentCaptor<List<MetricDatum>> datums = ArgumentCaptor.captor();
-        verify(metrics).putMetricDataForAccount(accountId == null ? isNull() : eq(accountId), eq(namespace),
-                datums.capture(), eq(REGION));
-        return datums.getValue();
-    }
-
-
-    @Test
-    void aMatchingEventPublishesTheLiteralValueAtTheEventTime() {
-        MetricTransformation t = transformation("ErrorCount", "App", "1");
-        t.setUnit("Count");
-        service.putMetricFilter(filter(GROUP, "errors", "ERROR", t), REGION);
-
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1", List.of(
-                event(1_700_000_000_000L, "[ERROR] one"),
-                event(1_700_000_001_000L, "[INFO] fine"),
-                event(1_700_000_002_000L, "[ERROR] two"))));
-
-        List<MetricDatum> datums = published("App");
-        assertEquals(2, datums.size());
-        assertEquals("ErrorCount", datums.get(0).getMetricName());
-        assertEquals(1.0, datums.get(0).getValue());
-        assertEquals("Count", datums.get(0).getUnit());
-        assertEquals(1_700_000_000L, datums.get(0).getTimestamp(), "the datum sits at the event's second");
-        assertEquals(1_700_000_002L, datums.get(1).getTimestamp());
-        assertEquals(List.of(), datums.get(0).getDimensions());
+    private static JsonNode evidence(String section) throws IOException {
+        return JSON.readTree(CloudWatchLogsMetricFilterPublishingTest.class.getResourceAsStream(
+                "/cloudwatchlogs/metric-filter-publishing-aws.json")).get(section);
     }
 
     @Test
-    void theValueCanComeFromAFieldOfTheEvent() {
-        service.putMetricFilter(filter(GROUP, "latency", "{ $.latency = * }", transformation("Latency", "App", "$.latency")),
-                REGION);
-
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1", List.of(
-                event(1_700_000_000_000L, "{\"latency\": 50, \"requestType\": \"GET\"}"),
-                event(1_700_000_001_000L, "{\"latency\": \"slow\"}"),
-                event(1_700_000_002_000L, "{\"latency\": 12.5}"))));
-
-        List<MetricDatum> datums = published("App");
-        assertEquals(2, datums.size(), "a matching event whose field is not a number publishes nothing");
-        assertEquals(50.0, datums.get(0).getValue());
-        assertEquals(12.5, datums.get(1).getValue());
-        assertEquals("None", datums.get(0).getUnit(), "no unit means None");
+    void recordedMixedAndSeparateBatchesContributePerEvent() throws IOException {
+        JsonNode data = evidence("metricDefaults");
+        int i = 0;
+        for (JsonNode scenario : data.get("cases")) {
+            String name = "case" + i;
+            f.put(name, data.get("filterPattern").asText(), data.get("metricValue").asText(),
+                    data.get("defaultValue").asDouble());
+            for (JsonNode batch : scenario.get("batches")) {
+                List<String> messages = new ArrayList<>();
+                batch.forEach(message -> messages.add(message.asText()));
+                f.ingest(TIME + i * 60_000L, messages.toArray(String[]::new));
+            }
+            JsonNode expected = scenario.get("expected");
+            f.stats(name, TIME + i * 60_000L, expected.get("Sum").asDouble(), expected.get("SampleCount").asDouble());
+            assertEquals(expected.get("Minimum").asDouble(), f.points(name, List.of(), TIME + i * 60_000L, REGION)
+                    .getFirst().minimum());
+            assertEquals(expected.get("Maximum").asDouble(), f.points(name, List.of(), TIME + i * 60_000L, REGION)
+                    .getFirst().maximum());
+            i++;
+        }
     }
 
     @Test
-    void spaceDelimitedFieldsFeedTheValueAndDimensions() {
-        MetricTransformation t = transformation("Volume", "Web", "$size");
-        t.setDimensions(Map.of("Status", "$status_code", "Method", "$1"));
-        service.putMetricFilter(filter(GROUP, "bytes", "[..., status_code, size]", t), REGION);
-
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1", List.of(
-                event(1_700_000_000_000L, "GET /index.html 200 1534"))));
-
-        List<MetricDatum> datums = published("Web");
-        assertEquals(1, datums.size());
-        assertEquals(1534.0, datums.getFirst().getValue());
-        assertEquals(List.of(new Dimension("Method", "GET"), new Dimension("Status", "200")),
-                datums.getFirst().getDimensions().stream().sorted((a, b) -> a.name().compareTo(b.name())).toList());
+    void threeQuietNonmatchesPublishImmediatelyWithoutClosingTraffic() {
+        f.put("quiet", "ERROR", "3", 7.0);
+        f.ingest(TIME, "INFO", "INFO", "INFO");
+        f.stats("quiet", TIME, 21, 3);
+        f.stats("quiet", TIME, 21, 3);
+        f.stats("quiet", TIME + 60_000, 0, 0);
     }
 
     @Test
-    void aDimensionWhoseFieldTheEventLacksIsLeftOut() {
-        MetricTransformation t = transformation("Events", "App", "1");
-        t.setDimensions(Map.of("eventType", "$.eventType", "user", "$.user"));
-        service.putMetricFilter(filter(GROUP, "events", "{ $.eventType = \"*\" }", t), REGION);
-
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1", List.of(
-                event(1_700_000_000_000L, "{\"eventType\": \"UpdateTrail\"}"))));
-
-        List<MetricDatum> datums = published("App");
-        assertEquals(List.of(new Dimension("eventType", "UpdateTrail")), datums.getFirst().getDimensions());
-    }
-
-    /**
-     * AWS reports metric filter values every minute and reports the default value for a minute that
-     * ingested logs without a match, so two calls inside one minute still produce one default. It
-     * is published once the next minute arrives, which is what settles the one before it.
-     */
-    @Test
-    void theDefaultValueIsPublishedOncePerMinuteRatherThanOncePerBatch() {
-        MetricTransformation t = transformation("ErrorCount", "App", "1");
-        t.setDefaultValue(0.0);
-        service.putMetricFilter(filter(GROUP, "errors", "ERROR", t), REGION);
-
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1",
-                List.of(event(1_700_000_000_000L, "[INFO] one"))));
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1",
-                List.of(event(1_700_000_005_000L, "[INFO] two"))));
-        verify(metrics, never()).putMetricDataForAccount(any(), anyString(), anyList(), anyString());
-
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1",
-                List.of(event(1_700_000_065_000L, "[INFO] the next minute"))));
-
-        List<MetricDatum> datums = allPublished("App");
-        assertEquals(1, datums.size(), "one default value for the minute, not one per batch");
-        assertEquals(0.0, datums.getFirst().getValue());
-        assertEquals(1_700_000_005L, datums.getFirst().getTimestamp(), "at that minute's last event");
-    }
-
-    /** A minute holding one miss and one match reports the match and no default value. */
-    @Test
-    void aMinuteThatMatchedSomethingReportsNoDefaultValue() {
-        MetricTransformation t = transformation("ErrorCount", "App", "1");
-        t.setDefaultValue(0.0);
-        service.putMetricFilter(filter(GROUP, "errors", "ERROR", t), REGION);
-
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1",
-                List.of(event(1_700_000_000_000L, "[INFO] one"))));
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1",
-                List.of(event(1_700_000_005_000L, "[ERROR] two"))));
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1",
-                List.of(event(1_700_000_065_000L, "[INFO] the next minute"))));
-
-        List<MetricDatum> datums = allPublished("App");
-        assertEquals(1, datums.size(), "the match alone");
-        assertEquals(1.0, datums.getFirst().getValue());
-    }
-
-    /** One batch spanning two minutes settles the earlier one on the spot. */
-    @Test
-    void aBatchSpanningTwoMinutesSettlesTheEarlierOne() {
-        MetricTransformation t = transformation("ErrorCount", "App", "1");
-        t.setDefaultValue(0.0);
-        service.putMetricFilter(filter(GROUP, "errors", "ERROR", t), REGION);
-
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1", List.of(
-                event(1_700_000_000_000L, "[INFO] first minute"),
-                event(1_700_000_065_000L, "[INFO] second minute"))));
-
-        List<MetricDatum> datums = allPublished("App");
-        assertEquals(1, datums.size(), "only the minute the batch moved past is settled");
-        assertEquals(1_700_000_000L, datums.getFirst().getTimestamp());
-    }
-
-    /** A match whose field is missing or not a number is still a match: no default for that batch. */
-    @Test
-    void theDefaultValueIsNotPublishedWhenAMatchHadNoNumericValue() {
-        MetricTransformation t = transformation("Latency", "App", "$.latency");
-        t.setDefaultValue(0.0);
-        service.putMetricFilter(filter(GROUP, "latency", "{ $.latency = * }", t), REGION);
-
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1", List.of(
-                event(1_700_000_000_000L, "{\"latency\": \"slow\"}"))));
-
-        verify(metrics, never()).putMetricDataForAccount(any(), anyString(), anyList(), anyString());
-    }
-
-    /**
-     * A batch a container streamed for another account, outside any request, runs that account's
-     * filters and publishes into that account's metrics, not the default account's.
-     */
-    @Test
-    void aBatchWrittenForAnotherAccountUsesThatAccountsFiltersAndMetrics() {
-        AccountAwareStorageBackend<MetricFilter> store = AccountAwareStorageBackend.inMemory("000000000000");
-        RegionResolver resolver = new RegionResolver(REGION, "000000000000");
-        CloudWatchLogsService logs = new CloudWatchLogsService(new InMemoryStorage<>(), new InMemoryStorage<>(),
-                new InMemoryStorage<>(), new InMemoryStorage<>(), 10_000, resolver);
-        logs.createLogGroup(GROUP, null, null, REGION);
-        service = new CloudWatchLogsMetricFilterService(store, logs, metrics, resolver);
-        service.putMetricFilter(filter(GROUP, "errors", "ERROR", transformation("Errors", "Default", "1")), REGION);
-        store.putForAccount("111111111111", REGION + "::" + GROUP + "::errors",
-                filter(GROUP, "errors", "ERROR", transformation("Errors", "Other", "1")));
-
-        service.onLogEventsIngested(new LogEventsIngested("111111111111", REGION, GROUP, "s1",
-                List.of(event(1_700_000_000_000L, "[ERROR] boom"))));
-
-        assertEquals(1, published("111111111111", "Other").size());
-        verify(metrics, never()).putMetricDataForAccount(any(), eq("Default"), anyList(), anyString());
+    void noEventsProduceNoPointsEvenWithANonzeroDefault() {
+        f.put("empty", "ERROR", "3", 7.0);
+        f.ingest(TIME);
+        assertTrue(f.metrics.listMetrics(null, null, null, REGION).isEmpty());
     }
 
     @Test
-    void theDefaultValueIsNotPublishedNextToMatches() {
-        MetricTransformation t = transformation("ErrorCount", "App", "1");
-        t.setDefaultValue(0.0);
-        service.putMetricFilter(filter(GROUP, "errors", "ERROR", t), REGION);
+    void lateMatchAppendsWithoutRetractingAlreadyPublishedDefault() {
+        f.put("late", "ERROR", "3", 11.0);
+        f.ingest(TIME, "INFO");
+        f.stats("late", TIME, 11, 1);
+        f.ingest(TIME + 1_000, "ERROR");
+        f.stats("late", TIME, 14, 2);
+    }
 
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1", List.of(
-                event(1_700_000_000_000L, "[ERROR] one"), event(1_700_000_001_000L, "[INFO] two"))));
-
-        assertEquals(1, published("App").size());
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void recordedExtractionDistinguishesMissingNullAndRawNonnumeric(boolean fallback) throws IOException {
+        JsonNode data = evidence("extraction");
+        f.put("extraction", data.get("filterPattern").asText(), data.get("metricValue").asText(),
+                fallback ? data.get("defaultValue").asDouble() : null);
+        int i = 0;
+        for (JsonNode scenario : data.get("cases")) {
+            long time = TIME + i++ * 60_000L;
+            f.ingest(time, scenario.get("message").toString());
+            JsonNode expected = scenario.get("expected");
+            boolean numeric = scenario.get("message").path("value").isNumber();
+            boolean present = expected.has("Sum") && (fallback || numeric);
+            f.stats("extraction", time, present ? expected.get("Sum").asDouble() : 0, present ? 1 : 0);
+        }
+        f.ingest(TIME + i * 60_000L, "INFO");
+        f.stats("extraction", TIME + i * 60_000L, fallback ? 7 : 0, fallback ? 1 : 0);
     }
 
     @Test
-    void nothingIsPublishedWithoutADefaultWhenNothingMatchedOrForOtherGroups() {
-        service.putMetricFilter(errorCounter(GROUP, "errors"), REGION);
-
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1", List.of(event(1L, "[INFO] fine"))));
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, OTHER_GROUP, "s1", List.of(event(1L, "[ERROR] boom"))));
-        service.onLogEventsIngested(new LogEventsIngested(null, "eu-west-1", GROUP, "s1", List.of(event(1L, "[ERROR] boom"))));
-
-        verify(metrics, never()).putMetricDataForAccount(any(), anyString(), anyList(), anyString());
+    void ordinaryDimensionsAreAllOrNoneAsRecorded() throws IOException {
+        JsonNode data = evidence("ordinaryDimensions");
+        MetricFilter filter = definition("dimensions", data.get("filterPattern").asText(), "1", null);
+        filter.getMetricTransformations().getFirst().setDimensions(Map.of("A", "$.a", "B", "$.b"));
+        f.service.putMetricFilter(filter, REGION);
+        for (JsonNode message : data.get("messages")) { f.ingest(TIME, message.toString()); }
+        for (JsonNode series : data.get("expectedSeries")) {
+            List<Dimension> dims = new ArrayList<>();
+            series.get("dimensions").properties().forEach(entry -> dims.add(new Dimension(entry.getKey(), entry.getValue().asText())));
+            f.stats("dimensions", dims, TIME, series.get("Sum").asDouble(), series.get("SampleCount").asDouble());
+        }
+        f.stats("dimensions", List.of(new Dimension("A", "alpha")), TIME, 0, 0);
+        f.stats("dimensions", List.of(new Dimension("B", "beta")), TIME, 0, 0);
     }
 
     @Test
-    void everyFilterOfTheGroupPublishesAndAFailingOneDoesNotStopTheOthers() {
-        service.putMetricFilter(filter(GROUP, "a", "ERROR", transformation("Errors", "Broken", "1")), REGION);
-        service.putMetricFilter(filter(GROUP, "b", "ERROR", transformation("Errors", "Fine", "1")), REGION);
-        doThrow(new IllegalStateException("store closed")).when(metrics)
-                .putMetricDataForAccount(isNull(), eq("Broken"), any(), eq(REGION));
-
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1", List.of(event(1L, "[ERROR] boom"))));
-
-        assertEquals(1, published("Fine").size());
+    void recordedSystemDimensionsApplyToMatchesButNotPatternNonmatchDefaults() throws IOException {
+        JsonNode data = evidence("systemDimensions");
+        int i = 0;
+        for (JsonNode scenario : data.get("cases")) {
+            String name = "system" + i++;
+            MetricFilter filter = definition(name, "ERROR", "3", 7.0);
+            List<String> fields = new ArrayList<>();
+            scenario.get("emitSystemFieldDimensions").forEach(field -> fields.add(field.asText()));
+            filter.setEmitSystemFieldDimensions(fields);
+            f.service.putMetricFilter(filter, REGION);
+            f.ingest(TIME, "ERROR", "INFO");
+            for (JsonNode series : scenario.get("expectedSeries")) {
+                List<Dimension> dims = new ArrayList<>();
+                series.get("dimensions").properties().forEach(entry -> dims.add(new Dimension(entry.getKey(),
+                        entry.getValue().asText().replace("<CALLER_ACCOUNT>", ACCOUNT))));
+                f.stats(name, dims, TIME, series.get("Sum").asDouble(), series.get("SampleCount").asDouble());
+            }
+            f.service.deleteMetricFilter(GROUP, name, REGION);
+        }
     }
 
-    /**
-     * The system fields a filter emits become dimensions on the datums it publishes, naming the
-     * account the batch was written for and its Region.
-     */
     @Test
-    void theEmittedSystemFieldsBecomeDimensions() {
-        MetricFilter filter = errorCounter(GROUP, "errors");
-        filter.setEmitSystemFieldDimensions(List.of("@aws.account", "@aws.region"));
-        service.putMetricFilter(filter, REGION);
-
-        service.onLogEventsIngested(new LogEventsIngested("111111111111", REGION, GROUP, "s1",
-                List.of(event(1_700_000_000_000L, "[ERROR] one"))));
-
-        List<MetricDatum> datums = published("111111111111", "App");
-        assertEquals(1, datums.size());
-        assertEquals(List.of("@aws.account", "@aws.region"),
-                datums.getFirst().getDimensions().stream().map(Dimension::name).toList());
-        assertEquals(List.of("111111111111", REGION),
-                datums.getFirst().getDimensions().stream().map(Dimension::value).toList());
-    }
-
-    /** A batch written without an explicit account carries the caller's own account. */
-    @Test
-    void theAccountDimensionNamesTheCallersOwnAccountWhenTheBatchNamesNone() {
-        MetricFilter filter = errorCounter(GROUP, "errors");
+    void inferredPolicyRetainsSystemDimensionsOnMatchingExtractionFallback() {
+        MetricFilter filter = definition("fallback", "{ $.probe = \"value\" || $.value = * }", "$.value", 7.0);
         filter.setEmitSystemFieldDimensions(List.of("@aws.account"));
-        service.putMetricFilter(filter, REGION);
-
-        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s1",
-                List.of(event(1_700_000_000_000L, "[ERROR] one"))));
-
-        assertEquals("000000000000", published("App").getFirst().getDimensions().getFirst().value());
+        f.service.putMetricFilter(filter, REGION);
+        f.ingest(TIME, "{\"probe\":\"value\"}", "{\"probe\":\"value\",\"value\":null}");
+        f.stats("fallback", List.of(new Dimension("@aws.account", ACCOUNT)), TIME, 14, 2);
+        f.stats("fallback", TIME, 0, 0);
     }
 
-    /**
-     * Selection criteria decide from the batch's account and Region whether the filter runs at all,
-     * so a batch they exclude publishes nothing, not even a default value.
-     */
     @Test
-    void aBatchTheSelectionCriteriaExcludePublishesNothing() {
-        MetricTransformation t = transformation("ErrorCount", "App", "1");
-        t.setDefaultValue(0.0);
-        MetricFilter filter = filter(GROUP, "errors", "ERROR", t);
-        filter.setFieldSelectionCriteria("@aws.account IN [\"222222222222\"]");
-        service.putMetricFilter(filter, REGION);
-
-        service.onLogEventsIngested(new LogEventsIngested("111111111111", REGION, GROUP, "s1",
-                List.of(event(1_700_000_000_000L, "[ERROR] one"))));
-
-        verify(metrics, never()).putMetricDataForAccount(anyString(), anyString(), anyList(), anyString());
+    void inferredPolicyDropsIncompleteOrdinarySetButRetainsSystemDimensions() {
+        MetricFilter filter = definition("incomplete", "{ $.a = * || $.b = * }", "1", null);
+        filter.getMetricTransformations().getFirst().setDimensions(Map.of("A", "$.a", "B", "$.b"));
+        filter.setEmitSystemFieldDimensions(List.of("@aws.region"));
+        f.service.putMetricFilter(filter, REGION);
+        f.ingest(TIME, "{\"a\":\"alpha\"}");
+        f.stats("incomplete", List.of(new Dimension("@aws.region", REGION)), TIME, 1, 1);
+        f.stats("incomplete", List.of(new Dimension("A", "alpha"), new Dimension("@aws.region", REGION)), TIME, 0, 0);
     }
 
-    /** A batch the criteria admit publishes exactly as an unfiltered one does. */
     @Test
-    void aBatchTheSelectionCriteriaAdmitPublishesAsUsual() {
-        MetricFilter filter = errorCounter(GROUP, "errors");
-        filter.setFieldSelectionCriteria("@aws.account = \"111111111111\" && @aws.region = \"" + REGION + "\"");
-        service.putMetricFilter(filter, REGION);
+    void timestampsComeFromEventsIncludingBeforeCreationAndFutureNotIngestionTime() {
+        f.put("time", "ERROR", "3", 7.0);
+        long future = (System.currentTimeMillis() / 60_000 + 10) * 60_000;
+        f.ingest(TIME, "ERROR", "INFO");
+        f.ingest(future, "ERROR", "INFO");
+        f.stats("time", TIME, 10, 2);
+        f.stats("time", future, 10, 2);
+        assertEquals("Count", f.points("time", List.of(), TIME, REGION).getFirst().unit());
+    }
 
-        service.onLogEventsIngested(new LogEventsIngested("111111111111", REGION, GROUP, "s1",
-                List.of(event(1_700_000_000_000L, "[ERROR] one"))));
+    @Test
+    void spaceDelimitedFieldsStillFeedValuesAndDimensions() {
+        MetricFilter filter = definition("space", "[..., status_code, size]", "$size", null);
+        filter.getMetricTransformations().getFirst().setDimensions(Map.of("Status", "$status_code", "Method", "$1"));
+        f.service.putMetricFilter(filter, REGION);
+        f.ingest(TIME, "GET /index.html 200 1534");
+        f.stats("space", List.of(new Dimension("Status", "200"), new Dimension("Method", "GET")), TIME, 1534, 1);
+    }
 
-        assertEquals(1, published("111111111111", "App").size());
+    @Test
+    void selectionRunsBeforeBothMatchesAndDefaults() {
+        MetricFilter filter = definition("selection", "ERROR", "3", 7.0);
+        filter.setFieldSelectionCriteria("@aws.account = \"" + OTHER_ACCOUNT + "\" AND @aws.region = \"" + REGION + "\"");
+        f.service.putMetricFilter(filter, REGION);
+        f.ingest(TIME, "ERROR", "INFO");
+        f.stats("selection", TIME, 0, 0);
+        f.account.set(OTHER_ACCOUNT);
+        f.group(GROUP, REGION);
+        f.service.putMetricFilter(filter, REGION);
+        f.account.set(ACCOUNT);
+        f.ingest(OTHER_ACCOUNT, GROUP, REGION, TIME, List.of("ERROR", "INFO"));
+        f.stats("selection", TIME, 0, 0);
+        f.account.set(OTHER_ACCOUNT);
+        f.stats("selection", TIME, 10, 2);
+    }
+
+    @Test
+    void selectionRegionExcludesBothDefaultAndMatchBeforePublication() {
+        MetricFilter filter = definition("region", "ERROR", "3", 7.0);
+        filter.setFieldSelectionCriteria("@aws.region = \"us-east-1\"");
+        f.service.putMetricFilter(filter, REGION);
+        f.ingest(TIME, "ERROR", "INFO");
+        f.stats("region", TIME, 0, 0);
+        filter.setFieldSelectionCriteria("@aws.region = \"" + REGION + "\"");
+        f.service.putMetricFilter(filter, REGION);
+        f.ingest(TIME, "ERROR", "INFO");
+        f.stats("region", TIME, 10, 2);
+    }
+
+    @Test
+    void otherGroupsRegionsAndAccountsDoNotUseTheCallersFilters() {
+        f.put("isolation", "ERROR", "3", 7.0);
+        f.group("/other", REGION);
+        f.group(GROUP, "us-east-1");
+        f.ingest(null, "/other", REGION, TIME, List.of("ERROR", "INFO"));
+        f.ingest(null, GROUP, "us-east-1", TIME, List.of("ERROR", "INFO"));
+        f.account.set(OTHER_ACCOUNT);
+        f.group(GROUP, REGION);
+        f.ingest(TIME, "ERROR", "INFO");
+        f.stats("isolation", TIME, 0, 0);
+        f.account.set(ACCOUNT);
+        f.stats("isolation", TIME, 0, 0);
+        f.ingest(TIME, "ERROR");
+        f.stats("isolation", TIME, 3, 1);
     }
 }

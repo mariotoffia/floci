@@ -52,6 +52,7 @@ class CloudWatchLogsHandlerTest {
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
                 10_000,
                 new RegionResolver(REGION, ACCOUNT)
         );
@@ -60,7 +61,7 @@ class CloudWatchLogsHandlerTest {
                 new CloudWatchLogsCrossAccountService(
                         new InMemoryStorage<>(), new InMemoryStorage<>(),
                         new RegionResolver(REGION, ACCOUNT), MAPPER),
-                new CloudWatchLogsMetricFilterService(new InMemoryStorage<>(), service,
+                new CloudWatchLogsMetricFilterService(service,
                         mock(CloudWatchMetricsService.class), new RegionResolver(REGION, ACCOUNT)),
                 MAPPER);
 

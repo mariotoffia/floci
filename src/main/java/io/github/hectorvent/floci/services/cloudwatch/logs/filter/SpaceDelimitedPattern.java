@@ -97,6 +97,8 @@ final class SpaceDelimitedPattern extends FilterPattern {
             String name = c.identifier();
             if (declared[0] == null) {
                 declared[0] = name;
+            } else if (!declared[0].equals(name)) {
+                throw c.error("a field condition cannot reference another field");
             }
             referenced.add(name);
             c.skipWhitespace();
@@ -105,6 +107,7 @@ final class SpaceDelimitedPattern extends FilterPattern {
             }
             Literal.Operator op = Literal.Operator.read(c);
             Literal literal = Literal.read(c, ",]&|)");
+            literal.validateOperator(op);
             if (literal.isRegex()) {
                 regexes[0]++;
             }
@@ -195,28 +198,24 @@ final class SpaceDelimitedPattern extends FilterPattern {
             if (i >= length) {
                 break;
             }
-            if (limit > 0 && fields.size() == limit - 1) {
-                fields.add(message.substring(i).strip());
-                break;
-            }
             char c = message.charAt(i);
             char closing = c == '"' ? '"' : c == '[' ? ']' : '\0';
-            if (closing != '\0') {
-                int end = message.indexOf(closing, i + 1);
-                if (end < 0) {
-                    fields.add(message.substring(i + 1));
-                    break;
-                }
-                fields.add(message.substring(i + 1, end));
-                i = end + 1;
+            int end = closing == '\0' ? -1 : message.indexOf(closing, i + 1);
+            boolean quoted = end >= 0;
+            if (quoted) {
+                end++;
             } else {
-                int end = i;
+                end = i;
                 while (end < length && !Character.isWhitespace(message.charAt(end))) {
                     end++;
                 }
-                fields.add(message.substring(i, end));
-                i = end;
             }
+            if (limit > 0 && fields.size() == limit - 1 && !message.substring(end).isBlank()) {
+                fields.add(message.substring(i));
+                break;
+            }
+            fields.add(quoted ? message.substring(i + 1, end - 1) : message.substring(i, end));
+            i = end;
         }
         return fields;
     }

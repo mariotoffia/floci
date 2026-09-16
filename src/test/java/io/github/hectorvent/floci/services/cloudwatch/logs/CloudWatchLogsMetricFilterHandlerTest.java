@@ -32,11 +32,12 @@ class CloudWatchLogsMetricFilterHandlerTest {
     @BeforeEach
     void setUp() {
         CloudWatchLogsService service = new CloudWatchLogsService(new InMemoryStorage<>(), new InMemoryStorage<>(),
-                new InMemoryStorage<>(), new InMemoryStorage<>(), 10_000, new RegionResolver(REGION, "000000000000"));
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                10_000, new RegionResolver(REGION, "000000000000"));
         handler = new CloudWatchLogsHandler(service,
                 new CloudWatchLogsCrossAccountService(new InMemoryStorage<>(), new InMemoryStorage<>(),
                         new RegionResolver(REGION, "000000000000"), MAPPER),
-                new CloudWatchLogsMetricFilterService(new InMemoryStorage<>(), service,
+                new CloudWatchLogsMetricFilterService(service,
                         mock(CloudWatchMetricsService.class), new RegionResolver(REGION, "000000000000")),
                 MAPPER);
         service.createLogGroup(GROUP, null, null, REGION);
@@ -101,7 +102,7 @@ class CloudWatchLogsMetricFilterHandlerTest {
                  "metricTransformations": [{"metricName": "Errors", "metricNamespace": "App", "metricValue": "1",
                    "defaultValue": "zero"}]}
                 """));
-        assertEquals("InvalidParameterException", e.getErrorCode());
+        assertEquals("SerializationException", e.getErrorCode());
     }
 
     @Test
@@ -152,7 +153,7 @@ class CloudWatchLogsMetricFilterHandlerTest {
 
         assertEquals(1, response.path("matches").size());
         JsonNode match = response.path("matches").get(0);
-        assertEquals(0, match.path("eventNumber").asLong());
+        assertEquals(1, match.path("eventNumber").asLong());
         assertTrue(match.path("eventMessage").asText().endsWith("200 1534"));
         assertEquals("1534", match.path("extractedValues").path("$size").asText());
         assertEquals("200", match.path("extractedValues").path("$status_code").asText());
@@ -160,7 +161,7 @@ class CloudWatchLogsMetricFilterHandlerTest {
 
         JsonNode terms = call("TestMetricFilter",
                 "{\"filterPattern\": \"\\\"[ERROR]\\\"\", \"logEventMessages\": [\"[INFO] up\", \"[ERROR] down\"]}");
-        assertEquals(1, terms.path("matches").get(0).path("eventNumber").asLong());
+        assertEquals(2, terms.path("matches").get(0).path("eventNumber").asLong());
         assertTrue(terms.path("matches").get(0).path("extractedValues").isObject());
         assertTrue(terms.path("matches").get(0).path("extractedValues").isEmpty());
     }

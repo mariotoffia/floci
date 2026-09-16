@@ -5,7 +5,7 @@ COPY pom.xml .
 RUN mvn dependency:go-offline -q
 
 COPY src/ src/
-RUN mvn test-compile -q
+RUN mvn test -q -Dtest=MetricFilterFixturePackagingTest
 
 ENV FLOCI_ENDPOINT=http://floci:4566
 

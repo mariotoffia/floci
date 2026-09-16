@@ -20,7 +20,9 @@ import jakarta.ws.rs.POST;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.security.GeneralSecurityException;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -145,12 +147,39 @@ public class EmulatorInfoController {
         return reset();
     }
 
-    private void performReset() {
-        // Storage first. Services re-create their bootstrap state in clear(), and a wipe
-        // afterwards would remove it again until the next restart.
-        storageFactory.clearAll();
-        for (Resettable r : resettables) {
-            r.clear();
+    private synchronized void performReset() {
+        // Resolve live instances before taking any storage locks. Serialize resets so one reset
+        // cannot resume a publisher while another is still wiping its storage.
+        List<Resettable> services = resettables.stream().toList();
+        List<Resettable> prepared = new ArrayList<>();
+        RuntimeException failure = null;
+        try {
+            for (Resettable service : services) {
+                prepared.add(service);
+                service.beforeReset();
+            }
+            // Storage still precedes clear(): services recreate their bootstrap state there.
+            storageFactory.clearAll();
+            for (Resettable service : services) {
+                service.clear();
+            }
+        } catch (RuntimeException e) {
+            failure = e;
+        } finally {
+            for (Resettable service : prepared.reversed()) {
+                try {
+                    service.afterReset();
+                } catch (RuntimeException e) {
+                    if (failure == null) {
+                        failure = e;
+                    } else {
+                        failure.addSuppressed(e);
+                    }
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
         }
     }
 

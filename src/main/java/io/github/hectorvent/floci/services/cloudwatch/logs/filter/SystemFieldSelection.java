@@ -40,7 +40,7 @@ public final class SystemFieldSelection {
             return new SystemFieldSelection(fields -> true);
         }
         PatternCursor cursor = new PatternCursor(text);
-        Condition<Fields> condition = Condition.parse(cursor, SystemFieldSelection::atom);
+        Condition<Fields> condition = Condition.parse(cursor, SystemFieldSelection::atom, true);
         cursor.expectEnd();
         return new SystemFieldSelection(condition);
     }
@@ -58,12 +58,15 @@ public final class SystemFieldSelection {
             return fields -> !value.equals(valueOf(field, fields));
         }
         if (cursor.consume("=")) {
+            if (cursor.peek() == '=') {
+                throw cursor.error("'==' is not an operator, use '='");
+            }
             String value = value(cursor);
             return fields -> value.equals(valueOf(field, fields));
         }
-        boolean negated = cursor.consume("NOT") || cursor.consume("not");
+        boolean negated = cursor.consumeKeyword("NOT") || cursor.consumeKeyword("not");
         cursor.skipWhitespace();
-        if (!cursor.consume("IN") && !cursor.consume("in")) {
+        if (!cursor.consumeKeyword("IN") && !cursor.consumeKeyword("in")) {
             throw cursor.error("expected '=', '!=', IN or NOT IN after " + field);
         }
         List<String> values = list(cursor);
@@ -83,7 +86,7 @@ public final class SystemFieldSelection {
 
     private static String value(PatternCursor cursor) {
         cursor.skipWhitespace();
-        return cursor.peek() == '"' ? cursor.quoted() : cursor.bareValue(",]()");
+        return cursor.peek() == '"' ? cursor.quoted() : cursor.bareValue(",]()=!<>|&");
     }
 
     private static List<String> list(PatternCursor cursor) {

@@ -1,0 +1,6 @@
+{
+  "region": "us-east-1",
+  "logGroupName": "/cfn/head-snapshot-migration",
+  "filterName": "legacy|count",
+  "absent": true
+}

@@ -82,9 +82,10 @@ public final class CfnRollback {
     public static final String DASHBOARD_UPDATE_SNAPSHOT_ATTR = "__FlociDashboardUpdateSnapshot";
 
     /**
-     * Holds the definition a metric filter had before an in-place update replaced it, or the fact
-     * that it did not exist, so a failed stack update can put it back. Written by
-     * {@code LogsMetricFilterCfnProvisioner} before its put and spent by its {@code rollbackUpdate}.
+     * Holds the complete prior metric filter, identity, name mode and per-address mutation outcomes
+     * and ownership states.
+     * Written before either an in-place put or a delete-then-create replacement; retained across
+     * failed restoration attempts and spent only after rollback or commit succeeds.
      */
     public static final String METRIC_FILTER_UPDATE_SNAPSHOT_ATTR = "__FlociMetricFilterUpdateSnapshot";
 

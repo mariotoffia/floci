@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
@@ -103,29 +104,28 @@ class CloudWatchLogsMetricFilterIntegrationTest {
     }
 
     @Test
-    void aTermFilterCountsMatchesAndPublishesTheDefaultValueForAMinuteWithoutOne() {
-        String group = "/it/metric-filter/errors-" + System.nanoTime();
+    void nonmatchDefaultsPublishPerEventWithoutSyntheticClosingEvents() {
+        String group = "/it/metric-filter/quiet-" + System.nanoTime();
         createGroupAndStream(group, "app");
         logs("PutMetricFilter", """
-                {"logGroupName":"%s","filterName":"errors","filterPattern":"ERROR",
-                 "metricTransformations":[{"metricName":"ErrorCount","metricNamespace":"%s","metricValue":"1",
-                   "defaultValue":0}]}
+                {"logGroupName":"%s","filterName":"quiet","filterPattern":"ERROR",
+                 "metricTransformations":[{"metricName":"ErrorCount","metricNamespace":"%s","metricValue":"3",
+                   "defaultValue":7}]}
                 """.formatted(group, group)).then().statusCode(200);
 
-        // The default value belongs to a one-minute period, and a period is settled once a later
-        // one arrives, so the middle minute is the one that reports it.
-        long now = System.currentTimeMillis();
-        putLogEvents(group, "app", now, List.of("[ERROR] one", "[INFO] fine", "[ERROR] two"));
-        putLogEvents(group, "app", now + 61_000, List.of("[INFO] only"));
-        putLogEvents(group, "app", now + 122_000, List.of("[INFO] later still"));
-
-        Instant from = Instant.ofEpochMilli(now).minusSeconds(120);
-        Instant to = Instant.ofEpochMilli(now).plusSeconds(120);
-        Response statistics = statistics(group, "ErrorCount", null, null, from, to);
-        assertEquals(2, sum(statistics), 0.001);
-        List<Float> samples = statistics.then().extract().jsonPath().getList("Datapoints.SampleCount", Float.class);
-        assertEquals(3, samples.stream().mapToDouble(Float::doubleValue).sum(), 0.001,
-                "two matches plus one default value for the minute that ingested without a match");
+        // Newly ingested historical events belong to their event minute, even before filter creation.
+        long time = (System.currentTimeMillis() / 60_000 - 10) * 60_000;
+        putLogEvents(group, "app", time, List.of("INFO one", "INFO two", "INFO three"));
+        Instant from = Instant.ofEpochMilli(time);
+        Instant to = from.plusSeconds(59);
+        for (int read = 0; read < 2; read++) {
+            Response result = statistics(group, "ErrorCount", null, null, from, to);
+            assertEquals(21, sum(result), 0.001);
+            result.then().body("Datapoints", hasSize(1)).body("Datapoints[0].SampleCount", equalTo(3.0f));
+        }
+        statistics(group, "ErrorCount", null, null, to.plusSeconds(1), to.plusSeconds(60)).then()
+                .statusCode(200).body("Datapoints", hasSize(0));
+        logs("DeleteLogGroup", "{\"logGroupName\":\"" + group + "\"}").then().statusCode(200);
     }
 
     @Test
@@ -161,9 +161,9 @@ class CloudWatchLogsMetricFilterIntegrationTest {
                 """).then()
                 .statusCode(200)
                 .body("matches", hasSize(1))
-                .body("matches[0].eventNumber", equalTo(0))
+                .body("matches[0].eventNumber", equalTo(1))
                 .body("matches[0].eventMessage", equalTo("{\"latency\": 50}"))
-                .body("matches[0].extractedValues.'$.latency'", equalTo("50"));
+                .body("matches[0].extractedValues", equalTo(Map.of()));
 
         logs("PutMetricFilter", """
                 {"logGroupName":"%s","filterName":"broken","filterPattern":"{ $.a = }",

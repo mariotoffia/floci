@@ -299,7 +299,9 @@ class FilterPatternTest {
             assertTrue(matches("{ $.flag IS TRUE }", "{\"flag\": true}"));
             assertTrue(matches("{ $.flag IS FALSE }", "{\"flag\": false}"));
             assertFalse(matches("{ $.flag IS TRUE }", "{\"flag\": \"true\"}"), "IS TRUE wants a boolean");
-            assertTrue(matches("{ $.flag = true }", "{\"flag\": true}"));
+            assertFalse(matches("{ $.flag = true }", "{\"flag\": true}"),
+                    "AWS comparisons exclude booleans; IS TRUE tests boolean values");
+            assertTrue(matches("{ $.flag = true }", "{\"flag\": \"true\"}"));
             assertTrue(matches("{ $.eventType = \"*\" }", EVENT), "a wildcard string matches any value");
             assertFalse(matches("{ $.SomeObject = \"*\" }", EVENT), "but not null");
             assertTrue(matches("{ $.count = \"3\" }", "{\"count\": 3}"), "a number compares by its text too");
@@ -308,10 +310,10 @@ class FilterPatternTest {
         }
 
         @Test
-        void extractedValuesAreTheSelectorsOfThePattern() {
+        void jsonMatchesExposeValuesInternallyButNotInTheTestMetricFilterExtractionMap() {
             FilterMatch m = match("{ $.eventType = \"UpdateTrail\" && $.objectList[1].id = 2 }", EVENT);
             assertTrue(m.matched());
-            assertEquals(Map.of("$.eventType", "UpdateTrail", "$.objectList[1].id", "2"), m.extractedValues());
+            assertEquals(Map.of(), m.extractedValues(), "observed AWS JSON TestMetricFilter response");
             assertEquals("UpdateTrail", m.value("$.eventType"));
             assertEquals("111.111.111.111", m.value("$.sourceIPAddress"), "any field can be read off a match");
             assertEquals("c", m.value("$.['cluster.name']"));

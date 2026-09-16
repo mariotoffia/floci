@@ -60,11 +60,16 @@ public abstract class FilterPattern {
     public abstract FilterMatch match(String message);
 
     /**
-     * Whether a metric value or dimension reference can be read off this pattern's matches: any
+     * Whether a field reference can be read off this pattern's matches: any
      * {@code $.path} for a JSON pattern, a declared {@code $name} or a position {@code $3} for a
      * space-delimited one, nothing for the others.
      */
     public abstract boolean declaresField(String reference);
+
+    /** Whether a reference addresses one field rather than a wildcard selection. */
+    public boolean declaresSingleValueField(String reference) {
+        return declaresField(reference);
+    }
 
     /** How many {@code %regex%} the pattern holds, for the per-pattern and per-log-group quotas. */
     public int regexCount() {

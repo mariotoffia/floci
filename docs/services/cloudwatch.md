@@ -68,18 +68,64 @@ Three actions are currently simplified:
 
 ### Metric filters {#metric-filters}
 
-A metric filter turns log events into a CloudWatch metric as they are written. On every
-`PutLogEvents`, each filter on the log group runs its pattern over the stored events and publishes
-one value per match, at the event's timestamp: the literal `metricValue`, or the field it names
-(`$.latency` in a JSON event, `$size` in a space-delimited one). Dimensions take their values from
-fields the same way, and a dimension whose field the event lacks is left out. The metric is then
-readable with `GetMetricStatistics` and `GetMetricData`, and alarms on it evaluate as usual.
+A metric filter turns newly ingested log events into CloudWatch metric samples. Each matching
+event contributes the literal `metricValue`, or its referenced field (`$.latency` in JSON,
+`$size` in space-delimited logs), at the **event timestamp**, not ingestion or filter-creation time.
+Events ingested before the filter existed are not replayed. Backdated and future event timestamps
+remain backdated and future metric timestamps.
 
-A `defaultValue` belongs to a one-minute period rather than to a `PutLogEvents` call, as it does on
-AWS: a minute that ingested logs without a match reports the default once, a minute holding any
-match reports no default, and a minute that ingested nothing reports nothing. A period is settled
-when a later one arrives, so the last minute before ingestion stops keeps its default value until
-traffic resumes, where AWS reports it when the minute ends.
+A configured `defaultValue` contributes **once per nonmatching event**, including alongside matches
+in the same batch or minute. A matching event with a missing or JSON-null metric-value field also
+uses the default; a present nonnumeric value is skipped, not replaced by the default. Without a
+default, those nonmatches and missing/null values produce no sample. No events means no samples.
+Healthy publication is immediate and needs no subsequent ingestion, reads, or timer. For example,
+pattern `ERROR`, value 3 and default 7 produce Sum 13 / SampleCount 3 for `ERROR, INFO, ERROR`,
+and three quiet nonmatches produce Sum 21 / SampleCount 3. A late match appends its value without
+retracting earlier defaults. CloudWatch aggregates these contributions by period; Floci has no
+minute-default accumulator or deduplication history.
+
+Ordinary transformation dimensions are all-or-none: a complete configured set is emitted, while
+a missing member produces a dimensionless sample, not a partial set. Requested system dimensions
+(`@aws.account`, `@aws.region`) are populated on matches using the resolved receiving account and
+region, including regular noncentralized Logs ingestion. **Pattern-nonmatch defaults are
+dimensionless**, even when system dimensions are requested. These scenarios are supported by the
+recorded [live AWS observations](cloudwatch-metric-filters-verification.md).
+
+**Inferred emulator policy, not a live AWS claim:** matching missing/null metric-value fallbacks
+retain requested system dimensions. Likewise, an incomplete ordinary dimension set is discarded
+as a unit while requested system dimensions are retained. Null ordinary dimension values are
+treated as missing; empty strings retain the existing scalar-extraction behavior. These combinations
+were not measured by the recorded probes. Floci does not infer centralized source provenance.
+
+**Runtime publication failures:** accepted Logs ingestion remains successful if the Metrics sink
+reports a failure. Each failed sample retains an immutable account/region/group/filter and transformation
+snapshot, event timestamp and stable internal publication ID. Retries replace that same metric-store
+key, making partial or ambiguous writes safe without deduplicating distinct identical log events.
+The existing AWS `PutMetricData` APIs continue appending samples as before.
+
+One managed worker retries only failed publications at one-second intervals while both Logs and
+Metrics services are enabled; idle ticks never create defaults. The process-wide queue holds at most
+**10,000 samples**, not 10,000 batches. This fixed conservative limit bounds outage memory without
+introducing a configuration surface. When full, new failed samples are dropped with an **ERROR**
+containing account, region, group, filter and dropped count; already queued samples and their IDs are
+preserved. Successful retries and cancellations release capacity. Each filter-owned outage logs
+one detailed stack, followed by a stack-free aggregate warning every 60 failed retry ticks.
+Recovery, cancellation and reset release that suppression. This is bounded best effort, not
+lossless delivery through an indefinite outage. Pending work is in memory only; crash-durable
+pending publication is not implemented. Storage failures that a backend only logs rather than
+throws are not observable to this retry path; configured storage durability semantics are unchanged.
+
+A filter update affects new ingestion only; old queued samples may still publish under the old
+definition. Deleting a filter or group cancels only its own account/region-scoped pending work and
+does not retract stored metrics. Reset pauses publication, drains active synchronous store writes,
+cancels pending work, wipes storage and resumes the same live service. The canonical filter-store
+monitor serializes publication with update/delete; reset hooks release it before the storage-factory
+wipe to avoid lock inversion. Shutdown drains active synchronous writes and cancels the queue before
+storage shutdown, then stops the worker (up to five seconds to await executor termination). Storage
+backends expose synchronous operations without a cancellation deadline; a stuck backend can delay
+that initial drain. Runtime cancellation is not a crash-recovery guarantee.
+
+Samples are readable with `GetMetricStatistics` and `GetMetricData`, and alarms evaluate normally.
 
 The filter pattern syntax follows the AWS reference:
 
@@ -97,11 +143,16 @@ The filter pattern syntax follows the AWS reference:
 
 `PutMetricFilter` applies the rules AWS applies: the log group must exist, the pattern must parse,
 at most two regular expressions per pattern, exactly one transformation whose `metricValue` is a
-number or a field the pattern can supply, at most three dimensions, only on JSON or space-delimited
-patterns and not together with a `defaultValue`, 100 filters per log group, and five regular expressions per
-log group, counted over the group's metric and subscription filters together and beside the two a
-single pattern may hold. `TestMetricFilter` reports matches with the extracted values as AWS does: named
-fields as `$name`, the others by position as `$1`, `$2` and so on.
+number or a single-valued field reference, at most three dimensions in total, and 100 metric
+filters per log group. Scalar JSON metric-value and dimension references need not be mentioned
+in the filter pattern. Wildcard metric-value references such as `$.values[*]` are rejected;
+wildcards remain available in the filter pattern itself. Ordinary dimensions are
+available only for JSON or space-delimited patterns and cannot be combined with a `defaultValue`;
+system-only dimensions can. The shared group regex quota counts up to five **regex-bearing filters**
+across metric and subscription filters, independently of the two expressions allowed per pattern.
+This shared pool is documentation-backed, not a new live mixed-writer claim. `TestMetricFilter`
+reports one-based event numbers. JSON matches have empty public `extractedValues`; space-delimited
+matches expose named fields as `$name` and positional fields as `$1`, `$2` and so on.
 
 `fieldSelectionCriteria` selects which batches a filter processes from the system fields
 `@aws.account` and `@aws.region`, with `=`, `!=`, `IN`, `NOT IN` and the `AND` and `OR` the API
@@ -109,12 +160,17 @@ documents, as in `@aws.account IN ["111111111111"]`. Both fields describe the in
 than the individual event, so one evaluation decides the batch. A criterion that does not parse is
 rejected when the filter is stored.
 
-`emitSystemFieldDimensions` adds `@aws.account` and `@aws.region` as dimensions on the values the
-filter publishes. They count toward the same limit of three dimensions AWS applies.
+`emitSystemFieldDimensions` adds `@aws.account` and `@aws.region` on matching contributions as
+described above. They count toward the same combined limit of three dimensions.
 
-`applyOnTransformedLogs` is stored and returned unchanged. It selects the transformed view of a log
-group that has a log transformer; Floci has no transformers, so there is no view that differs from
-the ingested events, and the Logs API documents no error for setting it without one.
+`applyOnTransformedLogs` is stored and returned unchanged. Request acceptance was verified on AWS,
+including `true` on the tested group without a group-level transformer. Floci does not execute
+group-level or account-level log transformations, including stored `TRANSFORMER_POLICY`
+configuration. Accepting the flag therefore does not establish transformed-log processing or
+full compatibility with an AWS group that has an active transformer.
+
+See [Metric-filter contract verification](cloudwatch-metric-filters-verification.md) for the
+scenarios tagged **Verified on Live AWS**, the recorded fixtures and their evidence boundaries.
 
 ### Logs Insights {#logs-insights}
 

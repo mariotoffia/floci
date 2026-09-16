@@ -1,13 +1,16 @@
 package io.github.hectorvent.floci.services.cloudwatch.logs.filter;
 
+import com.fasterxml.jackson.databind.JsonNode;
+
+import java.math.BigDecimal;
 import java.util.regex.Pattern;
 
 /**
  * The right-hand side of a JSON or space-delimited condition, and how it compares with a value from
  * a log event. A quoted or bare word compares as text, a word with an asterisk as a wildcard, a
- * number by value (a numeric string in the event counts as a number, as a quoted number in the
- * pattern still compares as text), and a {@code %regex%} by search. The ordering operators compare
- * numbers only.
+ * number by value, and a {@code %regex%} by search. JSON strings compare with the literal's text,
+ * never by numeric coercion. Space-delimited numeric fields compare by value. Ordering requires
+ * a numeric literal and, for JSON events, a numeric node.
  */
 final class Literal {
 
@@ -38,11 +41,11 @@ final class Literal {
     private static final Pattern NUMBER = Pattern.compile("[+-]?(\\d+\\.?\\d*|\\.\\d+)([eE][+-]?\\d+)?");
 
     private final String text;
-    private final Double number;
+    private final BigDecimal number;
     private final Pattern glob;
     private final AwsRegex regex;
 
-    private Literal(String text, Double number, Pattern glob, AwsRegex regex) {
+    private Literal(String text, BigDecimal number, Pattern glob, AwsRegex regex) {
         this.text = text;
         this.number = number;
         this.glob = glob;
@@ -57,7 +60,18 @@ final class Literal {
     /** A bare value: a number, a wildcard, or a word. */
     static Literal bare(String text) {
         if (NUMBER.matcher(text).matches()) {
-            return new Literal(text, Double.parseDouble(text), null, null);
+            try {
+                int exponent = Math.max(text.indexOf('e'), text.indexOf('E'));
+                if (exponent >= 0) {
+                    Integer.parseInt(text.substring(exponent + 1));
+                }
+                return new Literal(text, new BigDecimal(text), null, null);
+            } catch (NumberFormatException e) {
+                throw new FilterPatternException("Invalid filter pattern: numeric literal is out of range");
+            }
+        }
+        if (text.equals("null") || !text.matches("[\\p{L}\\p{N}_.*-]+")) {
+            throw new FilterPatternException("Invalid filter pattern: invalid unquoted value '" + text + "'");
         }
         return new Literal(text, null, globOf(text), null);
     }
@@ -96,6 +110,32 @@ final class Literal {
         return regex != null;
     }
 
+    void validateOperator(Operator op) {
+        if (op != Operator.EQ && op != Operator.NE && number == null) {
+            throw new FilterPatternException("Invalid filter pattern: ordering requires a numeric literal");
+        }
+    }
+
+    boolean test(Operator op, JsonNode node) {
+        if (!node.isTextual() && !node.isNumber()) {
+            return false;
+        }
+        if (number != null) {
+            if (node.isTextual()) {
+                return switch (op) {
+                    case EQ -> text.equals(node.textValue());
+                    case NE -> !text.equals(node.textValue());
+                    default -> false;
+                };
+            }
+            if (!Double.isFinite(node.doubleValue())) {
+                return false;
+            }
+            return compare(op, node.decimalValue().compareTo(number));
+        }
+        return test(op, node.asText());
+    }
+
     /** Whether the value from the event satisfies {@code op} against this literal. */
     boolean test(Operator op, String value) {
         return switch (op) {
@@ -110,8 +150,8 @@ final class Literal {
             return regex.find(value);
         }
         if (number != null) {
-            Double actual = parse(value);
-            return actual != null && actual.doubleValue() == number.doubleValue();
+            BigDecimal actual = parse(value);
+            return actual != null && actual.compareTo(number) == 0;
         }
         if (glob != null) {
             return glob.matcher(value).matches();
@@ -120,26 +160,30 @@ final class Literal {
     }
 
     private boolean orders(Operator op, String value) {
-        Double actual = number == null ? null : parse(value);
+        BigDecimal actual = number == null ? null : parse(value);
         if (actual == null) {
             return false;
         }
-        int comparison = Double.compare(actual, number);
+        return compare(op, actual.compareTo(number));
+    }
+
+    private static boolean compare(Operator op, int comparison) {
         return switch (op) {
+            case EQ -> comparison == 0;
+            case NE -> comparison != 0;
             case LT -> comparison < 0;
             case LE -> comparison <= 0;
             case GT -> comparison > 0;
             case GE -> comparison >= 0;
-            default -> false;
         };
     }
 
-    private static Double parse(String value) {
+    private static BigDecimal parse(String value) {
         if (!NUMBER.matcher(value).matches()) {
             return null;
         }
         try {
-            return Double.parseDouble(value);
+            return new BigDecimal(value);
         } catch (NumberFormatException e) {
             return null;
         }

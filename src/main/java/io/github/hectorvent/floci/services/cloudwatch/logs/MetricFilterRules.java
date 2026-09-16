@@ -47,7 +47,7 @@ final class MetricFilterRules {
             return;
         }
         for (String field : systemFields) {
-            if (!SYSTEM_FIELDS.contains(field)) {
+            if (field == null || !SYSTEM_FIELDS.contains(field)) {
                 throw invalid("emitSystemFieldDimensions must contain only @aws.account and @aws.region, got '"
                         + field + "'.");
             }
@@ -80,8 +80,8 @@ final class MetricFilterRules {
 
 /**
      * Whether a batch is one this filter processes. A filter with no selection criteria processes
-     * every batch, and so does one whose stored criteria no longer parse: dropping its metric
-     * silently would be worse than publishing it.
+     * every batch. Corrupted stored criteria are logged and skipped, never treated as selecting
+     * every account and Region.
      */
     static boolean selects(MetricFilter filter, String account, String region) {
         String criteria = filter.getFieldSelectionCriteria();
@@ -91,9 +91,10 @@ final class MetricFilterRules {
         try {
             return SystemFieldSelection.parse(criteria).test(account, region);
         } catch (FilterPatternException unparsable) {
-            LOG.warnv("Metric filter {0} has a fieldSelectionCriteria that no longer parses: {1}",
-                    filter.getFilterName(), unparsable.getMessage());
-            return true;
+            LOG.warnv("Skipping metric filter {0} on log group {1} in account {2}, Region {3}: "
+                            + "fieldSelectionCriteria no longer parses: {4}",
+                    filter.getFilterName(), filter.getLogGroupName(), account, region, unparsable.getMessage());
+            return false;
         }
     }
 
@@ -127,7 +128,8 @@ final class MetricFilterRules {
             return null;
         }
         try {
-            return Double.parseDouble(text);
+            double value = Double.parseDouble(text);
+            return Double.isFinite(value) ? value : null;
         } catch (NumberFormatException e) {
             return null;
         }

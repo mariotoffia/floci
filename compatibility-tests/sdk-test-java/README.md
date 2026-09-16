@@ -57,6 +57,47 @@ just test-java
 
 AWS credentials are always `test` / `test` / `us-east-1`.
 
+## Metric-filter closing gate
+
+Run both classes against a freshly built Floci JVM or native server:
+
+```bash
+# From compatibility-tests/sdk-test-java
+FLOCI_ENDPOINT=http://127.0.0.1:18084 ../../mvnw test \
+  -Dtest=CloudWatchLogsMetricFilterTest,CloudFormationLogsMetricFilterTest
+
+# Against a native server mapped to a different loopback port
+FLOCI_ENDPOINT=http://127.0.0.1:18085 ../../mvnw test \
+  -Dtest=CloudWatchLogsMetricFilterTest,CloudFormationLogsMetricFilterTest
+```
+
+Logs management uses real AWS SDK clients. The current dependency is SDK v2.52.0,
+which selects CloudWatch JSON. `MetricFilterQueryAssertions` additionally signs
+legacy form-encoded Query requests using the same test credentials, without
+introducing an older SDK dependency. Both `GetMetricStatistics` and
+`GetMetricData` paths assert identical stored samples, exact sum/count, event
+minute and dimension series. Query responses also assert the CloudWatch XML
+namespace. The quiet-default alarm check uses bounded condition polling.
+
+Expected publishing values come from the immutable root fixture
+`src/test/resources/cloudwatchlogs/metric-filter-publishing-aws.json`, not Floci
+output. A byte-identical copy is shipped in this module's test resources and
+loaded from the classpath, including inside the module-only Docker image.
+The root `CloudWatchLogsMetricFilterFixturePackagingTest` rejects drift in either
+SDK module copy. Additional checks cover quiet traffic, JSON public extraction shape,
+and CFN replacement/rollback. These commands target Floci only: passing them is
+not live AWS verification. For separately acknowledged AWS writes, see the
+opt-in stateful replay instructions in `../sdk-test-python/README.md`.
+
+The independent `MetricFilterFixturePackagingTest` has no SDK clients or
+`@BeforeAll` network hooks. Its offline image check, from the repository root:
+
+```bash
+docker build -t floci-sdk-java-fixtures compatibility-tests/sdk-test-java
+docker run --rm --network none --entrypoint mvn floci-sdk-java-fixtures \
+  -o -q test -Dtest=MetricFilterFixturePackagingTest
+```
+
 ## Docker
 
 ```bash

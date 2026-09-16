@@ -30,6 +30,7 @@ class CloudWatchLogsMetricFilterHandler {
     }
 
     Response handle(String action, JsonNode request, String region) {
+        requireObject(request, "request");
         return switch (action) {
             case "PutMetricFilter" -> putMetricFilter(request, region);
             case "DescribeMetricFilters" -> describeMetricFilters(request, region);
@@ -47,17 +48,25 @@ class CloudWatchLogsMetricFilterHandler {
         MetricFilter definition = new MetricFilter();
         definition.setLogGroupName(text(request, "logGroupName"));
         definition.setFilterName(text(request, "filterName"));
-        definition.setFilterPattern(request.has("filterPattern") ? request.path("filterPattern").asText() : null);
+        definition.setFilterPattern(text(request, "filterPattern"));
         List<MetricTransformation> transformations = new ArrayList<>();
-        request.path("metricTransformations").forEach(node -> transformations.add(transformation(node)));
+        JsonNode transformationNodes = request.get("metricTransformations");
+        requireArray(transformationNodes, "metricTransformations");
+        transformationNodes.forEach(node -> transformations.add(transformation(node)));
         definition.setMetricTransformations(transformations);
-        if (request.hasNonNull("applyOnTransformedLogs")) {
-            definition.setApplyOnTransformedLogs(request.path("applyOnTransformedLogs").asBoolean());
+        if (request.has("applyOnTransformedLogs")) {
+            JsonNode flag = request.get("applyOnTransformedLogs");
+            if (!flag.isBoolean()) {
+                throw invalid("applyOnTransformedLogs must be a boolean.");
+            }
+            definition.setApplyOnTransformedLogs(flag.booleanValue());
         }
         definition.setFieldSelectionCriteria(text(request, "fieldSelectionCriteria"));
-        if (request.hasNonNull("emitSystemFieldDimensions")) {
+        if (request.has("emitSystemFieldDimensions")) {
             List<String> fields = new ArrayList<>();
-            request.path("emitSystemFieldDimensions").forEach(node -> fields.add(node.asText()));
+            JsonNode fieldNodes = request.get("emitSystemFieldDimensions");
+            requireArray(fieldNodes, "emitSystemFieldDimensions");
+            fieldNodes.forEach(node -> fields.add(string(node, "emitSystemFieldDimensions member")));
             definition.setEmitSystemFieldDimensions(fields);
         }
         metricFilters.putMetricFilter(definition, region);
@@ -65,20 +74,30 @@ class CloudWatchLogsMetricFilterHandler {
     }
 
     private static MetricTransformation transformation(JsonNode node) {
+        requireObject(node, "metricTransformation");
         MetricTransformation t = new MetricTransformation();
         t.setMetricName(text(node, "metricName"));
         t.setMetricNamespace(text(node, "metricNamespace"));
         t.setMetricValue(text(node, "metricValue"));
-        if (node.hasNonNull("defaultValue")) {
+        if (node.has("defaultValue")) {
             JsonNode defaultValue = node.get("defaultValue");
-            if (!defaultValue.isNumber() && !(defaultValue.isTextual() && defaultValue.asText().matches("[+-]?\\d+(\\.\\d+)?"))) {
-                throw new AwsException("InvalidParameterException", "defaultValue must be a number.", 400);
+            if (defaultValue.isTextual()) {
+                throw new AwsException("SerializationException", "STRING_VALUE cannot be converted to Double", 400);
             }
-            t.setDefaultValue(defaultValue.asDouble());
+            if (!defaultValue.isNumber()) {
+                throw invalid("defaultValue must be a number.");
+            }
+            double value = defaultValue.asDouble();
+            if (!Double.isFinite(value)) {
+                throw invalid("defaultValue must be finite.");
+            }
+            t.setDefaultValue(value);
         }
-        if (node.hasNonNull("dimensions")) {
+        if (node.has("dimensions")) {
             Map<String, String> dimensions = new LinkedHashMap<>();
-            node.get("dimensions").fields().forEachRemaining(entry -> dimensions.put(entry.getKey(), entry.getValue().asText()));
+            requireObject(node.get("dimensions"), "dimensions");
+            node.get("dimensions").fields().forEachRemaining(entry ->
+                    dimensions.put(entry.getKey(), string(entry.getValue(), "dimension value")));
             t.setDimensions(dimensions);
         }
         t.setUnit(text(node, "unit"));
@@ -89,7 +108,7 @@ class CloudWatchLogsMetricFilterHandler {
         CloudWatchLogsMetricFilterService.DescribeMetricFiltersResult result = metricFilters.describeMetricFilters(
                 text(request, "logGroupName"), text(request, "filterNamePrefix"), text(request, "metricName"),
                 text(request, "metricNamespace"), text(request, "nextToken"),
-                request.hasNonNull("limit") ? request.path("limit").asInt() : null, region);
+                limit(request), region);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode filters = response.putArray("metricFilters");
         result.metricFilters().forEach(filter -> filters.add(render(filter)));
@@ -142,9 +161,11 @@ class CloudWatchLogsMetricFilterHandler {
 
     private Response testMetricFilter(JsonNode request) {
         List<String> messages = new ArrayList<>();
-        request.path("logEventMessages").forEach(node -> messages.add(node.asText()));
+        JsonNode messageNodes = request.get("logEventMessages");
+        requireArray(messageNodes, "logEventMessages");
+        messageNodes.forEach(node -> messages.add(string(node, "logEventMessages member")));
         List<CloudWatchLogsMetricFilterService.MetricFilterMatchRecord> matches = metricFilters.testMetricFilter(
-                request.has("filterPattern") ? request.path("filterPattern").asText() : null, messages);
+                text(request, "filterPattern"), messages);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode rendered = response.putArray("matches");
         for (CloudWatchLogsMetricFilterService.MetricFilterMatchRecord match : matches) {
@@ -158,6 +179,40 @@ class CloudWatchLogsMetricFilterHandler {
     }
 
     private static String text(JsonNode node, String member) {
-        return node.hasNonNull(member) ? node.get(member).asText() : null;
+        return node.has(member) ? string(node.get(member), member) : null;
+    }
+
+    private static String string(JsonNode node, String member) {
+        if (!node.isTextual()) {
+            throw invalid(member + " must be a string.");
+        }
+        return node.textValue();
+    }
+
+    private static void requireObject(JsonNode node, String member) {
+        if (node == null || !node.isObject()) {
+            throw invalid(member + " must be an object.");
+        }
+    }
+
+    private static void requireArray(JsonNode node, String member) {
+        if (node == null || !node.isArray()) {
+            throw invalid(member + " must be an array.");
+        }
+    }
+
+    private static Integer limit(JsonNode request) {
+        if (!request.has("limit")) {
+            return null;
+        }
+        JsonNode node = request.get("limit");
+        if (!node.isIntegralNumber() || !node.canConvertToInt() || node.intValue() < 1 || node.intValue() > 50) {
+            throw invalid("limit must be an integer between 1 and 50.");
+        }
+        return node.intValue();
+    }
+
+    private static AwsException invalid(String message) {
+        return new AwsException("InvalidParameterException", message, 400);
     }
 }

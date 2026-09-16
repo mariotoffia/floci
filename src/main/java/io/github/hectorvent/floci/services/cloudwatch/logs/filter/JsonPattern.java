@@ -6,9 +6,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
 
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 
 /**
@@ -16,7 +13,8 @@ import java.util.Map;
  * comparison with a literal, {@code IS NULL}, {@code IS TRUE}, {@code IS FALSE} or
  * {@code NOT EXISTS}, joined with {@code &&} and {@code ||}. A comparison holds when any node the
  * selector points at is a scalar that satisfies it; an object, an array or a missing property
- * satisfies none, as AWS documents.
+ * satisfies no scalar comparison. Wildcard inequality excludes a match if any selected value
+ * equals the literal.
  */
 final class JsonPattern extends FilterPattern {
 
@@ -28,45 +26,39 @@ final class JsonPattern extends FilterPattern {
     private static final int MAX_WILDCARDS = 3;
 
     private final Condition<JsonNode> condition;
-    private final List<JsonSelector> selectors;
     private final int regexes;
 
-    private JsonPattern(Condition<JsonNode> condition, List<JsonSelector> selectors, int regexes) {
+    private JsonPattern(Condition<JsonNode> condition, int regexes) {
         this.condition = condition;
-        this.selectors = selectors;
         this.regexes = regexes;
     }
 
     static JsonPattern of(String text) {
         PatternCursor cursor = new PatternCursor(text);
         cursor.expect('{');
-        List<JsonSelector> selectors = new ArrayList<>();
         int[] regexes = {0};
         int[] wildcards = {0};
-        Condition<JsonNode> condition = Condition.parse(cursor, c -> atom(c, selectors, regexes, wildcards));
+        Condition<JsonNode> condition = Condition.parse(cursor, c -> atom(c, regexes, wildcards));
         if (wildcards[0] > MAX_WILDCARDS) {
             throw new FilterPatternException("Invalid filter pattern: at most " + MAX_WILDCARDS
                     + " wildcard selectors are allowed in a filter pattern");
         }
         cursor.expect('}');
         cursor.expectEnd();
-        return new JsonPattern(condition, List.copyOf(selectors), regexes[0]);
+        return new JsonPattern(condition, regexes[0]);
     }
 
-    private static Condition<JsonNode> atom(PatternCursor cursor, List<JsonSelector> selectors, int[] regexes,
-                                            int[] wildcards) {
+    private static Condition<JsonNode> atom(PatternCursor cursor, int[] regexes, int[] wildcards) {
         JsonSelector selector = JsonSelector.read(cursor);
         wildcards[0] += selector.wildcards();
-        if (selectors.stream().noneMatch(s -> s.text().equals(selector.text()))) {
-            selectors.add(selector);
-        }
         cursor.skipWhitespace();
         if (Character.isLetter(cursor.peek())) {
             String keyword = cursor.identifier().toUpperCase();
             if (keyword.equals("IS")) {
                 String state = cursor.identifier().toUpperCase();
                 return switch (state) {
-                    case "NULL" -> root -> selector.resolve(root).stream().anyMatch(JsonNode::isNull);
+                    case "NULL" -> root -> selector.resolve(root).stream()
+                            .anyMatch(node -> isNull(node, selector.wildcards() == 0));
                     case "TRUE" -> root -> selector.resolve(root).stream()
                             .anyMatch(node -> node.isBoolean() && node.booleanValue());
                     case "FALSE" -> root -> selector.resolve(root).stream()
@@ -84,11 +76,29 @@ final class JsonPattern extends FilterPattern {
         }
         Literal.Operator op = Literal.Operator.read(cursor);
         Literal literal = Literal.read(cursor, "&|)}");
+        literal.validateOperator(op);
         if (literal.isRegex()) {
             regexes[0]++;
         }
-        return root -> selector.resolve(root).stream()
-                .anyMatch(node -> node.isValueNode() && !node.isNull() && literal.test(op, node.asText()));
+        if (op == Literal.Operator.NE && selector.wildcards() > 0) {
+            return root -> selector.wildcardParentExists(root) && selector.resolve(root).stream()
+                    .noneMatch(node -> literal.test(Literal.Operator.EQ, node));
+        }
+        return root -> selector.resolve(root).stream().anyMatch(node -> literal.test(op, node));
+    }
+
+    private static boolean isNull(JsonNode node, boolean includeArrayElements) {
+        if (node.isNull()) {
+            return true;
+        }
+        if (includeArrayElements && node.isArray()) {
+            for (JsonNode element : node) {
+                if (element.isNull()) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     @Override
@@ -104,17 +114,10 @@ final class JsonPattern extends FilterPattern {
         } catch (JsonProcessingException e) {
             return FilterMatch.NONE;
         }
-        if (root == null || !(root.isObject() || root.isArray()) || !condition.test(root)) {
+        if (root == null || !root.isObject() || !condition.test(root)) {
             return FilterMatch.NONE;
         }
-        Map<String, String> extracted = new LinkedHashMap<>();
-        for (JsonSelector selector : selectors) {
-            String value = selector.firstScalar(root);
-            if (value != null) {
-                extracted.put(selector.text(), value);
-            }
-        }
-        return FilterMatch.of(extracted, reference -> {
+        return FilterMatch.of(Map.of(), reference -> {
             JsonSelector selector = JsonSelector.parse(reference);
             return selector == null ? null : selector.firstScalar(root);
         });
@@ -123,6 +126,12 @@ final class JsonPattern extends FilterPattern {
     @Override
     public boolean declaresField(String reference) {
         return JsonSelector.parse(reference) != null;
+    }
+
+    @Override
+    public boolean declaresSingleValueField(String reference) {
+        JsonSelector selector = JsonSelector.parse(reference);
+        return selector != null && selector.wildcards() == 0;
     }
 
     @Override

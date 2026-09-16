@@ -3,11 +3,14 @@ package io.github.hectorvent.floci.services.cloudwatch.logs;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogEvent;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.MetricFilter;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.MetricTransformation;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -24,6 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 /**
  * The metric filter operations against the rules the Logs API documents. What a filter publishes
@@ -36,15 +40,17 @@ class CloudWatchLogsMetricFilterServiceTest {
     private static final String OTHER_GROUP = "/app/worker";
 
     private CloudWatchLogsMetricFilterService service;
+    private CloudWatchMetricsService metrics;
 
     @BeforeEach
     void setUp() {
         RegionResolver resolver = new RegionResolver(REGION, "000000000000");
         CloudWatchLogsService logs = new CloudWatchLogsService(new InMemoryStorage<>(), new InMemoryStorage<>(),
-                new InMemoryStorage<>(), new InMemoryStorage<>(), 10_000, resolver);
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), 10_000, resolver);
         logs.createLogGroup(GROUP, null, null, REGION);
         logs.createLogGroup(OTHER_GROUP, null, null, REGION);
-        service = new CloudWatchLogsMetricFilterService(new InMemoryStorage<>(), logs, mock(CloudWatchMetricsService.class), resolver);
+        metrics = mock(CloudWatchMetricsService.class);
+        service = new CloudWatchLogsMetricFilterService(logs, metrics, resolver);
     }
 
     private static MetricTransformation transformation(String name, String namespace, String value) {
@@ -188,6 +194,39 @@ class CloudWatchLogsMetricFilterServiceTest {
                 "InvalidParameterException");
         rejected(() -> service.putMetricFilter(filter(GROUP, "x", "ERROR", transformation("A", "N", "1".repeat(101))), REGION),
                 "InvalidParameterException");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1e309", "-1e309", "1e9999999999"})
+    void numericLiteralMustBeFinite(String value) {
+        service.putMetricFilter(errorCounter(GROUP, "existing"), REGION);
+        rejected(() -> service.putMetricFilter(
+                filter(GROUP, "existing", "WARN", transformation("A", "N", value)), REGION),
+                "InvalidParameterException");
+        assertEquals("ERROR", service.findMetricFilter(GROUP, "existing", REGION).orElseThrow().getFilterPattern());
+    }
+
+    @ParameterizedTest
+    @ValueSource(doubles = {Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY})
+    void directServiceDefaultValueMustBeFinite(double value) {
+        MetricTransformation t = transformation("A", "N", "1");
+        t.setDefaultValue(value);
+        rejected(() -> service.putMetricFilter(filter(GROUP, "bad-default", "ERROR", t), REGION),
+                "InvalidParameterException");
+        assertTrue(service.findMetricFilter(GROUP, "bad-default", REGION).isEmpty());
+    }
+
+    @Test
+    void ingestionDoesNotPublishANonFiniteStoredLiteral() {
+        MetricFilter stored = service.putMetricFilter(errorCounter(GROUP, "legacy"), REGION);
+        stored.getMetricTransformations().getFirst().setMetricValue("1e309");
+        LogEvent event = new LogEvent();
+        event.setMessage("ERROR");
+        event.setTimestamp(1_700_000_000_000L);
+
+        service.onLogEventsIngested(new LogEventsIngested(null, REGION, GROUP, "s", List.of(event)));
+
+        verifyNoInteractions(metrics);
     }
 
     @Test
@@ -384,7 +423,7 @@ class CloudWatchLogsMetricFilterServiceTest {
     // ──────────────────────────── TestMetricFilter ────────────────────────────
 
     @Test
-    void testMetricFilterReportsMatchesWithZeroBasedNumbersAndExtractedValues() {
+    void testMetricFilterReportsMatchesWithOneBasedNumbersAndExtractedValues() {
         List<CloudWatchLogsMetricFilterService.MetricFilterMatchRecord> matches = service.testMetricFilter(
                 "[..., status_code=200, size]", List.of(
                         "127.0.0.1 - frank [10/Oct/2000:13:25:15 -0700] \"GET /apache_pb.gif HTTP/1.0\" 200 1534",
@@ -392,8 +431,8 @@ class CloudWatchLogsMetricFilterServiceTest {
                         "127.0.0.1 - frank [10/Oct/2000:13:50:35 -0700] \"GET /apache_pb.gif HTTP/1.0\" 200 4355"));
 
         assertEquals(2, matches.size());
-        assertEquals(0, matches.get(0).eventNumber());
-        assertEquals(2, matches.get(1).eventNumber());
+        assertEquals(1, matches.get(0).eventNumber());
+        assertEquals(3, matches.get(1).eventNumber());
         assertEquals("1534", matches.get(0).extractedValues().get("$size"));
         assertEquals("200", matches.get(0).extractedValues().get("$status_code"));
         assertEquals("frank", matches.get(0).extractedValues().get("$3"));
@@ -402,8 +441,17 @@ class CloudWatchLogsMetricFilterServiceTest {
         List<CloudWatchLogsMetricFilterService.MetricFilterMatchRecord> terms = service.testMetricFilter(
                 "\"[ERROR]\"", List.of("[INFO] up", "[ERROR] down"));
         assertEquals(1, terms.size());
-        assertEquals(1, terms.getFirst().eventNumber());
+        assertEquals(2, terms.getFirst().eventNumber());
         assertEquals(Map.of(), terms.getFirst().extractedValues());
+    }
+
+    @Test
+    void testMetricFilterDoesNotExposeJsonExtractions() {
+        List<CloudWatchLogsMetricFilterService.MetricFilterMatchRecord> matches = service.testMetricFilter(
+                "{ $.latency = * }", List.of("plain text", "{\"latency\":50}"));
+        assertEquals(1, matches.size());
+        assertEquals(2, matches.getFirst().eventNumber());
+        assertEquals(Map.of(), matches.getFirst().extractedValues());
     }
 
     @Test
@@ -420,17 +468,18 @@ class CloudWatchLogsMetricFilterServiceTest {
     }
 
     /**
-     * AWS allows five regular expressions per log group, so two patterns holding two each and one
-     * holding a single expression fill the quota. Replacing a filter reuses its slot, a pattern
+     * AWS allows five regex-bearing filters per log group, each holding up to two expressions.
+     * Replacing a filter reuses its slot, a pattern
      * without a regular expression never counts, and the quota is per log group.
      */
     @Test
     void theRegexQuotaOfALogGroup() {
-        service.putMetricFilter(filter(GROUP, "r0", "%ERROR% %WARN%", transformation("E", "App", "1")), REGION);
-        service.putMetricFilter(filter(GROUP, "r1", "%FATAL% %TRACE%", transformation("E", "App", "1")), REGION);
-        service.putMetricFilter(filter(GROUP, "r2", "%DEBUG%", transformation("E", "App", "1")), REGION);
+        for (int i = 0; i < 5; i++) {
+            service.putMetricFilter(filter(GROUP, "r" + i, "{ $.a = %ERROR% || $.a = %WARN% }",
+                    transformation("E", "App", "1")), REGION);
+        }
 
-        rejected(() -> service.putMetricFilter(filter(GROUP, "r3", "%INFO%", transformation("E", "App", "1")), REGION),
+        rejected(() -> service.putMetricFilter(filter(GROUP, "r5", "%INFO%", transformation("E", "App", "1")), REGION),
                 "LimitExceededException");
 
         service.putMetricFilter(filter(GROUP, "r2", "%NOTICE%", transformation("E", "App", "1")), REGION);

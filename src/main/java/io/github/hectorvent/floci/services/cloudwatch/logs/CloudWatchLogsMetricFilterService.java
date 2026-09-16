@@ -1,22 +1,23 @@
 package io.github.hectorvent.floci.services.cloudwatch.logs;
 
-import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
-import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudwatch.logs.filter.FilterMatch;
 import io.github.hectorvent.floci.services.cloudwatch.logs.filter.FilterPattern;
-import io.github.hectorvent.floci.services.cloudwatch.logs.filter.FilterPatternException;
-import io.github.hectorvent.floci.services.cloudwatch.logs.filter.SystemFieldSelection;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogEvent;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.MetricFilter;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.MetricTransformation;
-import io.github.hectorvent.floci.services.cloudwatch.logs.model.SubscriptionFilter;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
+import io.quarkus.runtime.ShutdownEvent;
+import io.quarkus.runtime.StartupEvent;
+import jakarta.annotation.PreDestroy;
+import jakarta.annotation.Priority;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
@@ -24,15 +25,20 @@ import org.jboss.logging.Logger;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.SortedMap;
-import java.util.TreeMap;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.regex.Pattern;
 
+import static io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService.requireFilterPattern;
 import static io.github.hectorvent.floci.services.cloudwatch.logs.MetricFilterRules.MAX_DIMENSIONS;
 import static io.github.hectorvent.floci.services.cloudwatch.logs.MetricFilterRules.NUMBER;
 import static io.github.hectorvent.floci.services.cloudwatch.logs.MetricFilterRules.invalid;
@@ -46,23 +52,17 @@ import static io.github.hectorvent.floci.services.cloudwatch.logs.MetricFilterRu
  * Metric filters of CloudWatch Logs: the PutMetricFilter, DescribeMetricFilters, DeleteMetricFilter
  * and TestMetricFilter operations, and the part AWS does at ingestion, publishing a metric value for
  * every log event a filter matches. The filters live in their own store, keyed by Region, log group
- * and name; the log service tells this one about ingested events and deleted groups through CDI
- * events, so neither depends on the other's internals.
+ * and name. Both filter families share storage coordination with the log service, which tells
+ * this one about ingestion and deleted groups through CDI events.
  */
 @ApplicationScoped
-public class CloudWatchLogsMetricFilterService {
+public class CloudWatchLogsMetricFilterService implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(CloudWatchLogsMetricFilterService.class);
 
     /** AWS's cap on metric filters per log group. */
     public static final int MAX_FILTERS_PER_LOG_GROUP = 100;
-    private static final int MAX_FILTER_PATTERN_LENGTH = 1024;
     private static final int MAX_METRIC_VALUE_LENGTH = 100;
-    /**
-     * AWS's quota on regular expressions in one log group, counted over its metric and
-     * subscription filters together.
-     */
-    public static final int MAX_REGEXES_PER_LOG_GROUP = 5;
     private static final int MAX_DIMENSION_LENGTH = 255;
     private static final int MAX_TEST_MESSAGES = 50;
     private static final int MAX_DESCRIBE_LIMIT = 50;
@@ -78,18 +78,45 @@ public class CloudWatchLogsMetricFilterService {
     private final CloudWatchLogsService logsService;
     private final CloudWatchMetricsService metricsService;
     private final RegionResolver regionResolver;
-    private final MetricFilterMinutes minutes = new MetricFilterMinutes();
 
-    @Inject
-    public CloudWatchLogsMetricFilterService(StorageFactory storageFactory, CloudWatchLogsService logsService,
-                                             CloudWatchMetricsService metricsService, RegionResolver regionResolver) {
-        this(storageFactory.create("cloudwatchlogs", "cwlogs-metric-filters.json",
-                new TypeReference<Map<String, MetricFilter>>() {}), logsService, metricsService, regionResolver);
+    /** Process-local best effort, bounded by samples, not ingestion batches. No durable outbox. */
+    private static final int MAX_PENDING_SAMPLES = 10_000;
+    private final Map<String, Publication> pending = new LinkedHashMap<>();
+    // One detail per owning filter's pending-work outage, then one aggregate warning per 60
+    // failed worker ticks (at least a minute at the production cadence). No exceptions retained.
+    private static final int RETRY_FAILURE_SUMMARY_TICKS = 60;
+    private final Set<Owner> reportedOutages = new HashSet<>();
+    private int failedRetryTicks;
+    // The canonical filter backend is the only monitor, shared with quotas and group deletion.
+    // Never acquire StorageFactory's monitor while holding a separate runtime-state monitor.
+    private ScheduledExecutorService retryWorker;
+    private boolean enabled = true;
+    private boolean paused;
+    private boolean stopped;
+
+    private record Owner(String account, String region, String group, String filter) {}
+
+    private record Publication(String id, Owner owner, String namespace, String metricName, String unit,
+                               List<Dimension> dimensions, double value, long timestamp) {
+        Publication {
+            dimensions = List.copyOf(dimensions);
+        }
+
+        MetricDatum datum() {
+            MetricDatum datum = new MetricDatum();
+            datum.setMetricName(metricName);
+            datum.setUnit(unit);
+            datum.setDimensions(dimensions);
+            datum.setValue(value);
+            datum.setTimestamp(timestamp);
+            return datum;
+        }
     }
 
-    CloudWatchLogsMetricFilterService(StorageBackend<String, MetricFilter> store, CloudWatchLogsService logsService,
-                                      CloudWatchMetricsService metricsService, RegionResolver regionResolver) {
-        this.store = store;
+    @Inject
+    public CloudWatchLogsMetricFilterService(CloudWatchLogsService logsService,
+                                             CloudWatchMetricsService metricsService, RegionResolver regionResolver) {
+        this.store = logsService.metricFilterStore();
         this.logsService = logsService;
         this.metricsService = metricsService;
         this.regionResolver = regionResolver;
@@ -109,36 +136,142 @@ public class CloudWatchLogsMetricFilterService {
      * of a JSON or space-delimited pattern and exclude a default value, and the group holds at
      * most 100 filters.
      */
-    public synchronized MetricFilter putMetricFilter(MetricFilter definition, String region) {
-        String logGroupName = requireLogGroup(definition.getLogGroupName(), region);
-        String filterName = requireFilterName(definition.getFilterName());
-        FilterPattern pattern = requirePattern(definition.getFilterPattern());
-        MetricTransformation transformation = requireTransformation(definition.getMetricTransformations(), pattern);
-        validateSystemFields(definition.getEmitSystemFieldDimensions(), transformation);
-        validateFieldSelectionCriteria(definition.getFieldSelectionCriteria());
+    public MetricFilter putMetricFilter(MetricFilter definition, String region) {
+        return putMetricFilter(definition, region, false, null);
+    }
 
-        String key = key(region, logGroupName, filterName);
-        Optional<MetricFilter> existing = store.get(key);
-        if (existing.isEmpty() && countMetricFilters(logGroupName, region) >= MAX_FILTERS_PER_LOG_GROUP) {
-            throw new AwsException("LimitExceededException",
-                    "The log group " + logGroupName + " already has the maximum of " + MAX_FILTERS_PER_LOG_GROUP
-                            + " metric filters.", 400);
+    public enum MutationOutcome { APPLIED, NOT_APPLIED, UNKNOWN }
+
+    /** Internal mutation evidence; presence is null when it could not be inspected. */
+    public record MutationResult(MutationOutcome outcome, Boolean present) {}
+
+    /** Internal CFN create: never adopts an existing filter through the public API's upsert. */
+    public MetricFilter createMetricFilter(MetricFilter definition, String region,
+                                           Consumer<MutationResult> outcome) {
+        return putMetricFilter(definition, region, true, outcome);
+    }
+
+    /** Internal CFN update of a confirmed-owned identity, including snapshot restoration. */
+    public MetricFilter updateMetricFilter(MetricFilter definition, String region,
+                                           Consumer<MutationResult> outcome) {
+        return putMetricFilter(definition, region, false, outcome);
+    }
+
+    private MetricFilter putMetricFilter(MetricFilter definition, String region,
+                                         boolean createOnly, Consumer<MutationResult> outcome) {
+        synchronized (store) {
+            String logGroupName;
+            String filterName;
+            String key;
+            MetricFilter before = null;
+            Boolean present = null;
+            MetricFilter filter;
+            try {
+                logGroupName = requireLogGroup(definition.getLogGroupName(), region);
+                filterName = requireFilterName(definition.getFilterName());
+                key = key(region, logGroupName, filterName);
+                if (createOnly) {
+                    before = store.get(key).orElse(null);
+                    present = before != null;
+                    if (before != null) {
+                        throw new AwsException("AlreadyExistsException",
+                                "Metric filter " + filterName + " already exists in " + logGroupName, 400);
+                    }
+                }
+                FilterPattern pattern = requireFilterPattern(definition.getFilterPattern());
+                MetricTransformation transformation = requireTransformation(definition.getMetricTransformations(), pattern);
+                validateSystemFields(definition.getEmitSystemFieldDimensions(), transformation);
+                validateFieldSelectionCriteria(definition.getFieldSelectionCriteria());
+                if (!createOnly) {
+                    before = store.get(key).orElse(null);
+                    present = before != null;
+                }
+                if (before == null && countMetricFilters(logGroupName, region) >= MAX_FILTERS_PER_LOG_GROUP) {
+                    throw new AwsException("LimitExceededException",
+                            "The log group " + logGroupName + " already has the maximum of " + MAX_FILTERS_PER_LOG_GROUP
+                                    + " metric filters.", 400);
+                }
+                logsService.validateFilterRegexQuota(logGroupName, filterName, pattern, true, region);
+
+                filter = new MetricFilter();
+                filter.setLogGroupName(logGroupName);
+                filter.setFilterName(filterName);
+                filter.setFilterPattern(definition.getFilterPattern());
+                filter.setMetricTransformations(List.of(copy(transformation)));
+                filter.setCreationTime(before == null ? System.currentTimeMillis() : before.getCreationTime());
+                filter.setApplyOnTransformedLogs(definition.getApplyOnTransformedLogs());
+                filter.setFieldSelectionCriteria(definition.getFieldSelectionCriteria());
+                filter.setEmitSystemFieldDimensions(definition.getEmitSystemFieldDimensions() == null
+                        ? null : List.copyOf(definition.getEmitSystemFieldDimensions()));
+            } catch (RuntimeException failure) {
+                completeMutation(new MutationResult(MutationOutcome.NOT_APPLIED, present), outcome, null, failure);
+                throw failure;
+            }
+            mutateStore(key, before, filter, outcome, null);
+            LOG.infov("Put metric filter {0} on log group {1}", filterName, logGroupName);
+            return filter;
         }
-        validateRegexQuota(logGroupName, filterName, pattern, region);
+    }
 
-        MetricFilter filter = new MetricFilter();
-        filter.setLogGroupName(logGroupName);
-        filter.setFilterName(filterName);
-        filter.setFilterPattern(definition.getFilterPattern());
-        filter.setMetricTransformations(List.of(copy(transformation)));
-        filter.setCreationTime(existing.map(MetricFilter::getCreationTime).orElseGet(System::currentTimeMillis));
-        filter.setApplyOnTransformedLogs(definition.getApplyOnTransformedLogs());
-        filter.setFieldSelectionCriteria(definition.getFieldSelectionCriteria());
-        filter.setEmitSystemFieldDimensions(definition.getEmitSystemFieldDimensions() == null
-                ? null : List.copyOf(definition.getEmitSystemFieldDimensions()));
-        store.put(key, filter);
-        LOG.infov("Put metric filter {0} on log group {1}", filterName, logGroupName);
-        return filter;
+    /** The caller holds the canonical monitor through inspection and metadata recording. */
+    private void mutateStore(String key, MetricFilter before, MetricFilter after,
+                             Consumer<MutationResult> outcome, Runnable onAbsent) {
+        RuntimeException failure = null;
+        MutationResult result = new MutationResult(MutationOutcome.APPLIED, after != null);
+        try {
+            if (after == null) {
+                store.delete(key);
+            } else {
+                store.put(key, after);
+            }
+        } catch (RuntimeException storageFailure) {
+            failure = storageFailure;
+            result = new MutationResult(MutationOutcome.UNKNOWN, null);
+            if (outcome != null) {
+                try {
+                    MetricFilter current = store.get(key).orElse(null);
+                    if (current == after) {
+                        result = new MutationResult(MutationOutcome.APPLIED, current != null);
+                    } else if (current == before) {
+                        result = new MutationResult(MutationOutcome.NOT_APPLIED, current != null);
+                    }
+                } catch (RuntimeException inspectionFailure) {
+                    if (storageFailure != inspectionFailure) {
+                        storageFailure.addSuppressed(inspectionFailure);
+                    }
+                }
+            }
+        }
+        completeMutation(result, outcome, onAbsent, failure);
+    }
+
+    private static void completeMutation(MutationResult result, Consumer<MutationResult> outcome,
+                                         Runnable onAbsent, RuntimeException failure) {
+        if (outcome != null) {
+            try {
+                outcome.accept(result);
+            } catch (RuntimeException recordingFailure) {
+                if (failure == null) {
+                    failure = recordingFailure;
+                } else if (failure != recordingFailure) {
+                    failure.addSuppressed(recordingFailure);
+                }
+            }
+        }
+        if (onAbsent != null && Boolean.FALSE.equals(result.present())) {
+            try {
+                onAbsent.run();
+            } catch (RuntimeException cleanupFailure) {
+                if (failure == null) {
+                    failure = cleanupFailure;
+                } else if (failure != cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     private String requireLogGroup(String logGroupName, String region) {
@@ -161,20 +294,6 @@ public class CloudWatchLogsMetricFilterService {
         return filterName;
     }
 
-    private static FilterPattern requirePattern(String filterPattern) {
-        if (filterPattern == null) {
-            throw invalid("filterPattern is required.");
-        }
-        if (filterPattern.length() > MAX_FILTER_PATTERN_LENGTH) {
-            throw invalid("filterPattern must be at most " + MAX_FILTER_PATTERN_LENGTH + " characters.");
-        }
-        try {
-            return FilterPattern.parse(filterPattern);
-        } catch (FilterPatternException e) {
-            throw invalid(e.getMessage());
-        }
-    }
-
     private static MetricTransformation requireTransformation(List<MetricTransformation> transformations,
                                                               FilterPattern pattern) {
         if (transformations == null || transformations.size() != 1 || transformations.getFirst() == null) {
@@ -191,9 +310,11 @@ public class CloudWatchLogsMetricFilterService {
         if (value == null || value.isBlank() || value.length() > MAX_METRIC_VALUE_LENGTH) {
             throw invalid("metricValue is required and must be at most " + MAX_METRIC_VALUE_LENGTH + " characters.");
         }
-        if (!NUMBER.matcher(value).matches() && !pattern.declaresField(value)) {
-            throw invalid("metricValue must be a number or a field of the filter pattern such as $.field or $field, got '"
-                    + value + "'.");
+        if (NUMBER.matcher(value).matches() ? number(value) == null : !pattern.declaresSingleValueField(value)) {
+            throw invalid("Invalid metric transformation: metric value " + value + " must be a valid number");
+        }
+        if (t.getDefaultValue() != null && !Double.isFinite(t.getDefaultValue())) {
+            throw invalid("defaultValue must be a finite number.");
         }
         Map<String, String> dimensions = t.getDimensions();
         if (dimensions != null && !dimensions.isEmpty()) {
@@ -222,49 +343,6 @@ public class CloudWatchLogsMetricFilterService {
             throw invalid("unit must be one of the CloudWatch standard units, got '" + t.getUnit() + "'.");
         }
         return t;
-    }
-
-    
-    /**
-     * AWS allows five regular expressions per log group, counted over its metric and subscription
-     * filters together, beside the two a single pattern may hold. Replacing a filter does not count
-     * the definition it replaces, and a pattern Floci cannot parse counts as holding none.
-     */
-    private void validateRegexQuota(String logGroupName, String filterName, FilterPattern pattern, String region) {
-        int used = pattern.regexCount();
-        if (used == 0) {
-            return;
-        }
-        for (MetricFilter other : filtersOf(logGroupName, region)) {
-            if (!filterName.equals(other.getFilterName())) {
-                used += regexCountOf(other.getFilterPattern());
-            }
-        }
-        for (SubscriptionFilter other : subscriptionFiltersOf(logGroupName, region)) {
-            used += regexCountOf(other.getFilterPattern());
-        }
-        if (used > MAX_REGEXES_PER_LOG_GROUP) {
-            throw new AwsException("LimitExceededException",
-                    "The log group " + logGroupName + " already has the maximum of "
-                            + MAX_REGEXES_PER_LOG_GROUP + " regular expressions.", 400);
-        }
-    }
-
-    private static int regexCountOf(String filterPattern) {
-        try {
-            return FilterPattern.parse(filterPattern).regexCount();
-        } catch (FilterPatternException unparsable) {
-            return 0;
-        }
-    }
-
-    private List<SubscriptionFilter> subscriptionFiltersOf(String logGroupName, String region) {
-        try {
-            return logsService.describeSubscriptionFilters(logGroupName, null, null, 0, region)
-                    .subscriptionFilters();
-        } catch (RuntimeException e) {
-            return List.of();
-        }
     }
 
     private static MetricTransformation copy(MetricTransformation t) {
@@ -327,18 +405,60 @@ public class CloudWatchLogsMetricFilterService {
                 metricNamespace.equals(t.getMetricNamespace()) && (metricName == null || metricName.equals(t.getMetricName())));
     }
 
-    public synchronized void deleteMetricFilter(String logGroupName, String filterName, String region) {
-        requireLogGroup(logGroupName, region);
-        if (filterName == null || filterName.isBlank()) {
-            throw invalid("filterName is required.");
+    public void deleteMetricFilter(String logGroupName, String filterName, String region) {
+        synchronized (store) {
+            requireLogGroup(logGroupName, region);
+            if (filterName == null || filterName.isBlank()) {
+                throw invalid("filterName is required.");
+            }
+            String key = key(region, logGroupName, filterName);
+            if (store.get(key).isEmpty()) {
+                throw new AwsException("ResourceNotFoundException", "The specified metric filter does not exist.", 400);
+            }
+            store.delete(key);
+            cancelPublications(logGroupName, filterName, region);
+            LOG.infov("Deleted metric filter {0} on log group {1}", filterName, logGroupName);
         }
-        String key = key(region, logGroupName, filterName);
-        if (store.get(key).isEmpty()) {
-            throw new AwsException("ResourceNotFoundException", "The specified metric filter does not exist.", 400);
+    }
+
+    /** Internal CFN delete with evidence recorded before another creator can acquire the monitor. */
+    public void deleteMetricFilter(String logGroupName, String filterName, String region,
+                                   Consumer<MutationResult> outcome) {
+        synchronized (store) {
+            String key = key(region, logGroupName, filterName);
+            MetricFilter before;
+            try {
+                before = store.get(key).orElse(null);
+            } catch (RuntimeException failure) {
+                completeMutation(new MutationResult(MutationOutcome.NOT_APPLIED, null), outcome, null, failure);
+                throw failure;
+            }
+            Runnable cancel = () -> cancelPublications(logGroupName, filterName, region);
+            if (before == null) {
+                completeMutation(new MutationResult(MutationOutcome.NOT_APPLIED, false), outcome, cancel, null);
+                return;
+            }
+            mutateStore(key, before, null, outcome, cancel);
+            LOG.infov("Deleted metric filter {0} on log group {1}", filterName, logGroupName);
         }
-        store.delete(key);
-        minutes.forgetFilter(region, logGroupName, filterName);
-        LOG.infov("Deleted metric filter {0} on log group {1}", filterName, logGroupName);
+    }
+
+    /** Confirms absence and records relinquished ownership atomically, without touching a surviving row. */
+    public boolean confirmMetricFilterAbsent(String logGroupName, String filterName, String region, Runnable onAbsent) {
+        synchronized (store) {
+            if (store.get(key(region, logGroupName, filterName)).isPresent()) {
+                return false;
+            }
+            completeMutation(new MutationResult(MutationOutcome.NOT_APPLIED, false), ignored -> onAbsent.run(),
+                    () -> cancelPublications(logGroupName, filterName, region), null);
+            return true;
+        }
+    }
+
+    private void cancelPublications(String logGroupName, String filterName, String region) {
+        Owner owner = new Owner(regionResolver.getAccountId(), region, logGroupName, filterName);
+        pending.values().removeIf(p -> p.owner().equals(owner));
+        forgetCompletedOutages();
     }
 
     public Optional<MetricFilter> findMetricFilter(String logGroupName, String filterName, String region) {
@@ -349,9 +469,9 @@ public class CloudWatchLogsMetricFilterService {
         return filtersOf(logGroupName, region).size();
     }
 
-    /** Runs a pattern over sample messages, the TestMetricFilter operation; event numbers start at zero. */
+    /** Runs a pattern over sample messages, the TestMetricFilter operation; event numbers start at one. */
     public List<MetricFilterMatchRecord> testMetricFilter(String filterPattern, List<String> messages) {
-        FilterPattern pattern = requirePattern(filterPattern);
+        FilterPattern pattern = requireFilterPattern(filterPattern);
         if (messages == null || messages.isEmpty() || messages.size() > MAX_TEST_MESSAGES) {
             throw invalid("logEventMessages must contain between 1 and " + MAX_TEST_MESSAGES + " messages.");
         }
@@ -363,48 +483,47 @@ public class CloudWatchLogsMetricFilterService {
             }
             FilterMatch match = pattern.match(message);
             if (match.matched()) {
-                matches.add(new MetricFilterMatchRecord(i, message, match.extractedValues()));
+                matches.add(new MetricFilterMatchRecord(i + 1L, message, match.extractedValues()));
             }
         }
         return matches;
     }
 
-    /**
-     * Metric filters go with their log group, as on AWS. Synchronized with the puts so a put that
-     * saw the group before its deletion cannot slip its filter in behind the cascade.
-     */
-    synchronized void onLogGroupDeleted(@Observes LogGroupDeleted event) {
-        String prefix = groupPrefix(event.region(), event.logGroupName());
-        List<String> keys = store.keys().stream().filter(key -> key.startsWith(prefix)).toList();
-        keys.forEach(store::delete);
-        minutes.forgetGroup(event.region(), event.logGroupName());
-        if (!keys.isEmpty()) {
-            LOG.debugv("Deleted {0} metric filter(s) with log group {1}", keys.size(), event.logGroupName());
+    /** Logs cascades first; retain idempotent cleanup for standalone observer callers as well. */
+    void onLogGroupDeleted(@Observes LogGroupDeleted event) {
+        synchronized (store) {
+            String account = regionResolver.getAccountId();
+            String prefix = groupPrefix(event.region(), event.logGroupName());
+            store.keys().stream().filter(key -> key.startsWith(prefix)).toList().forEach(store::delete);
+            pending.values().removeIf(p -> p.owner().account().equals(account)
+                    && p.owner().region().equals(event.region()) && p.owner().group().equals(event.logGroupName()));
+            forgetCompletedOutages();
         }
     }
 
-    /**
-     * Publishes the metrics of the group's filters for a stored batch: one value per matching
-     * event, at the event's timestamp, with the dimensions whose fields the event carries, and the
-     * default value once for a one-minute period that ingested logs without a match. The filters and the metrics are those
-     * of the account the batch was written for, the caller's own unless the writer named one. A
-     * filter whose {@code fieldSelectionCriteria} does not select this account and Region skips the
-     * batch entirely, as it does on AWS. A filter that cannot publish is logged and skipped: AWS
-     * never fails an ingestion because of a metric filter.
-     */
+    /** Publishes each event's contribution immediately, independent of other events or later traffic. */
     void onLogEventsIngested(@Observes LogEventsIngested event) {
-        String account = event.accountId() == null || event.accountId().isBlank()
-                ? regionResolver.getAccountId()
-                : event.accountId();
-        for (MetricFilter filter : filtersOf(event.logGroupName(), event.region(), event.accountId())) {
+        synchronized (store) {
+            if (!enabled || paused || stopped) {
+                return;
+            }
+            String account = event.accountId() == null || event.accountId().isBlank()
+                    ? regionResolver.getAccountId() : event.accountId();
             try {
-                if (!selects(filter, account, event.region())) {
-                    continue;
+                for (MetricFilter filter : filtersOf(event.logGroupName(), event.region(), account)) {
+                    try {
+                        if (selects(filter, account, event.region())) {
+                            publish(filter, event, account);
+                        }
+                    } catch (RuntimeException e) {
+                        LOG.errorv(e, "Cannot evaluate metric filter: account={0}, region={1}, group={2}, filter={3}",
+                                account, event.region(), event.logGroupName(), filter.getFilterName());
+                    }
                 }
-                publish(filter, event, account);
             } catch (RuntimeException e) {
-                LOG.warnv(e, "Metric filter {0} on log group {1} could not publish its metric",
-                        filter.getFilterName(), event.logGroupName());
+                // Stored Logs remain successful even if the definition store cannot be read.
+                LOG.errorv(e, "Cannot load metric filters; publication not queued: account={0}, region={1}, group={2}",
+                        account, event.region(), event.logGroupName());
             }
         }
     }
@@ -412,57 +531,195 @@ public class CloudWatchLogsMetricFilterService {
     private void publish(MetricFilter filter, LogEventsIngested event, String account) {
         FilterPattern pattern = FilterPattern.parse(filter.getFilterPattern());
         MetricTransformation t = filter.getMetricTransformations().getFirst();
-        Double literal = NUMBER.matcher(t.getMetricValue()).matches() ? Double.parseDouble(t.getMetricValue()) : null;
-        List<MetricDatum> datums = new ArrayList<>();
-        SortedMap<Long, MetricFilterMinutes.Minute> batch = new TreeMap<>();
-        boolean tracksMinutes = t.getDefaultValue() != null;
+        Double literal = number(t.getMetricValue());
+        Owner owner = new Owner(account, event.region(), event.logGroupName(), filter.getFilterName());
+        int failed = 0;
+        int dropped = 0;
+        RuntimeException firstFailure = null;
         for (LogEvent logEvent : event.events()) {
             FilterMatch match = pattern.match(logEvent.getMessage());
-            if (tracksMinutes) {
-                MetricFilterMinutes.record(batch, logEvent.getTimestamp(), match.matched());
-            }
-            if (!match.matched()) {
-                continue;
-            }
-            // A match whose field is missing or not a number publishes nothing, and it is still a
-            // match: the default value is for batches the pattern matched nothing in.
-            Double value = literal != null ? literal : number(match.value(t.getMetricValue()));
-            if (value == null) {
-                continue;
-            }
-            List<Dimension> dimensions = withSystemDimensions(filter, account, event.region(), new ArrayList<>());
-            if (t.getDimensions() != null) {
-                t.getDimensions().forEach((name, reference) -> {
-                    String dimensionValue = match.value(reference);
-                    if (dimensionValue != null) {
-                        dimensions.add(new Dimension(name, dimensionValue));
+            Double value = t.getDefaultValue();
+            List<Dimension> dimensions = new ArrayList<>();
+            if (match.matched()) {
+                // Preserve raw text: only missing/null falls back. A present nonnumeric value skips.
+                String raw = match.value(t.getMetricValue());
+                value = literal != null ? literal : raw == null ? t.getDefaultValue() : number(raw);
+                if (t.getDimensions() != null) {
+                    for (Map.Entry<String, String> dimension : t.getDimensions().entrySet()) {
+                        String extracted = match.value(dimension.getValue());
+                        if (extracted == null) {
+                            dimensions.clear();
+                            break;
+                        }
+                        dimensions.add(new Dimension(dimension.getKey(), extracted));
                     }
-                });
+                }
+                // Policy for unmeasured combinations: matching fallback and incomplete ordinary
+                // dimensions retain system dimensions. Pattern-nonmatch defaults are dimensionless.
+                withSystemDimensions(filter, account, event.region(), dimensions);
             }
-            datums.add(datum(t, value, dimensions, logEvent.getTimestamp()));
-        }
-        if (tracksMinutes) {
-            String key = MetricFilterMinutes.key(event.region(), event.logGroupName(), filter.getFilterName(), account);
-            for (long due : minutes.close(key, batch)) {
-                datums.add(datum(t, t.getDefaultValue(),
-                        withSystemDimensions(filter, account, event.region(), new ArrayList<>()), due));
+            if (value != null) {
+                Publication publication = new Publication(UUID.randomUUID().toString(), owner, t.getMetricNamespace(),
+                        t.getMetricName(), t.getUnit() == null ? "None" : t.getUnit(), dimensions,
+                        value, logEvent.getTimestamp() / 1000);
+                try {
+                    write(publication);
+                } catch (RuntimeException e) {
+                    failed++;
+                    if (firstFailure == null) {
+                        firstFailure = e;
+                    }
+                    if (pending.size() < MAX_PENDING_SAMPLES) {
+                        pending.put(publication.id(), publication);
+                    } else {
+                        dropped++;
+                    }
+                }
             }
         }
-        if (!datums.isEmpty()) {
-            metricsService.putMetricDataForAccount(event.accountId(), t.getMetricNamespace(), datums, event.region());
+        if (failed > dropped) {
+            // Only retained work owns suppression state. Dropped-only work gets the ERROR below.
+            logPublicationFailureOnce(owner, firstFailure);
+        }
+        if (dropped > 0) {
+            LOG.errorv("Metric publication retry queue overflow: account={0}, region={1}, group={2}, filter={3}, dropped={4}, capacity={5}",
+                    account, event.region(), event.logGroupName(), filter.getFilterName(), dropped, MAX_PENDING_SAMPLES);
         }
     }
 
-    
-    
-    private static MetricDatum datum(MetricTransformation t, double value, List<Dimension> dimensions, long timestampMillis) {
-        MetricDatum datum = new MetricDatum();
-        datum.setMetricName(t.getMetricName());
-        datum.setValue(value);
-        datum.setUnit(t.getUnit() == null ? "None" : t.getUnit());
-        datum.setDimensions(dimensions);
-        datum.setTimestamp(timestampMillis / 1000);
-        return datum;
+    private void write(Publication publication) {
+        metricsService.publishMetricForAccount(publication.owner().account(), publication.namespace(),
+                publication.datum(), publication.owner().region(), publication.id());
+    }
+
+    /** The production worker's entry point, also used by deterministic fault/race tests. */
+    void retryPending() {
+        try {
+            synchronized (store) {
+                if (!enabled || paused || stopped) {
+                    return;
+                }
+                for (Publication publication : List.copyOf(pending.values())) {
+                    try {
+                        write(publication);
+                        pending.remove(publication.id());
+                    } catch (RuntimeException e) {
+                        // Retain this exact snapshot/ID. Other filters still get their attempt.
+                        logPublicationFailureOnce(publication.owner(), e);
+                    }
+                }
+                forgetCompletedOutages();
+                if (!pending.isEmpty() && ++failedRetryTicks >= RETRY_FAILURE_SUMMARY_TICKS) {
+                    LOG.warnv("Metric publication retries still failing: filters={0}, failedSamples={1}",
+                            reportedOutages.size(), pending.size());
+                    failedRetryTicks = 0;
+                }
+            }
+        } catch (RuntimeException e) {
+            // Scheduled executors suppress every future tick if any invocation escapes.
+            LOG.errorv(e, "Metric publication retry tick failed; pending work retained");
+        }
+    }
+
+    private void logPublicationFailureOnce(Owner owner, RuntimeException failure) {
+        if (reportedOutages.add(owner)) {
+            LOG.warnv(failure, "Metric publication failed: account={0}, region={1}, group={2}, filter={3}, pending={4}",
+                    owner.account(), owner.region(), owner.group(), owner.filter(), pending.size());
+        }
+    }
+
+    /** Called under the canonical monitor after drain/cancellation. State is bounded by pending owners. */
+    private void forgetCompletedOutages() {
+        Set<Owner> activeOwners = new HashSet<>();
+        for (Publication publication : pending.values()) {
+            activeOwners.add(publication.owner());
+        }
+        reportedOutages.retainAll(activeOwners);
+        if (pending.isEmpty()) {
+            failedRetryTicks = 0;
+        }
+    }
+
+    void onStart(@Observes StartupEvent event, EmulatorConfig config) {
+        start(config.services().cloudwatchlogs().enabled(), config.services().cloudwatchmetrics().enabled());
+    }
+
+    void start(boolean logsEnabled, boolean metricsEnabled) {
+        synchronized (store) {
+            if (retryWorker != null || stopped) {
+                return;
+            }
+            enabled = logsEnabled && metricsEnabled;
+            if (enabled) {
+                retryWorker = Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "logs-metric-publication-retry"));
+                retryWorker.scheduleWithFixedDelay(this::retryPending, 1, 1, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    // Stop before EmulatorLifecycle's default-priority storage flush/shutdown observer.
+    void onStop(@Observes @Priority(1000) ShutdownEvent event) {
+        stop();
+    }
+
+    @PreDestroy
+    void stop() {
+        ScheduledExecutorService worker;
+        synchronized (store) {
+            stopped = true;
+            pending.clear();
+            forgetCompletedOutages();
+            worker = retryWorker;
+        }
+        if (worker != null) {
+            worker.shutdownNow();
+            try {
+                if (!worker.awaitTermination(5, TimeUnit.SECONDS)) {
+                    LOG.errorv("Metric publication retry worker did not terminate within 5 seconds");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOG.warnv(e, "Interrupted while stopping metric publication retry worker");
+            }
+        }
+    }
+
+    int pendingSamples() {
+        synchronized (store) {
+            return pending.size();
+        }
+    }
+
+    boolean retryWorkerRunning() {
+        synchronized (store) {
+            return retryWorker != null && !retryWorker.isShutdown();
+        }
+    }
+
+    @Override
+    public void beforeReset() {
+        synchronized (store) {
+            // Acquiring the canonical monitor drains any active write. Release it before the
+            // controller enters StorageFactory.clearAll(), avoiding factory/backend inversion.
+            paused = true;
+            pending.clear();
+            forgetCompletedOutages();
+        }
+    }
+
+    @Override
+    public void afterReset() {
+        synchronized (store) {
+            paused = false;
+        }
+    }
+
+    @Override
+    public void clear() {
+        synchronized (store) {
+            pending.clear();
+            forgetCompletedOutages();
+        }
     }
 
     private List<MetricFilter> filtersOf(String logGroupName, String region) {

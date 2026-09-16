@@ -37,6 +37,7 @@ class CloudWatchLogsInputConstraintTest {
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
                 10_000,
                 new RegionResolver(REGION, ACCOUNT)
         );
@@ -45,7 +46,7 @@ class CloudWatchLogsInputConstraintTest {
                 new CloudWatchLogsCrossAccountService(
                         new InMemoryStorage<>(), new InMemoryStorage<>(),
                         new RegionResolver(REGION, ACCOUNT), MAPPER),
-                new CloudWatchLogsMetricFilterService(new InMemoryStorage<>(), service,
+                new CloudWatchLogsMetricFilterService(service,
                         mock(CloudWatchMetricsService.class), new RegionResolver(REGION, ACCOUNT)),
                 MAPPER);
         service.createLogGroup(GROUP, null, null, REGION);

@@ -7,6 +7,7 @@ import java.util.function.Function;
 /**
  * A boolean expression over one log event, shared by the JSON and space-delimited syntaxes: atoms
  * joined with {@code &&} and {@code ||}, grouped with parentheses, {@code &&} binding tighter.
+ * System-field selection opts into keyword operators without changing either log grammar.
  * {@code C} is what an atom is evaluated against, a parsed JSON document or the event's fields.
  */
 @FunctionalInterface
@@ -27,27 +28,34 @@ interface Condition<C> {
      * at the cursor, reading atoms through {@code atom}.
      */
     static <C> Condition<C> parse(PatternCursor cursor, Function<PatternCursor, Condition<C>> atom) {
+        return parse(cursor, atom, false);
+    }
+
+    static <C> Condition<C> parse(PatternCursor cursor, Function<PatternCursor, Condition<C>> atom,
+                                  boolean keywordOperators) {
         List<Condition<C>> alternatives = new ArrayList<>();
         do {
-            alternatives.add(parseAnd(cursor, atom));
+            alternatives.add(parseAnd(cursor, atom, keywordOperators));
             cursor.skipWhitespace();
-        } while (cursor.consume("||"));
+        } while (cursor.consume("||") || keywordOperators && cursor.consumeKeyword("OR"));
         return alternatives.size() == 1 ? alternatives.getFirst() : or(alternatives);
     }
 
-    private static <C> Condition<C> parseAnd(PatternCursor cursor, Function<PatternCursor, Condition<C>> atom) {
+    private static <C> Condition<C> parseAnd(PatternCursor cursor, Function<PatternCursor, Condition<C>> atom,
+                                             boolean keywordOperators) {
         List<Condition<C>> operands = new ArrayList<>();
         do {
-            operands.add(parseUnary(cursor, atom));
+            operands.add(parseUnary(cursor, atom, keywordOperators));
             cursor.skipWhitespace();
-        } while (cursor.consume("&&"));
+        } while (cursor.consume("&&") || keywordOperators && cursor.consumeKeyword("AND"));
         return operands.size() == 1 ? operands.getFirst() : and(operands);
     }
 
-    private static <C> Condition<C> parseUnary(PatternCursor cursor, Function<PatternCursor, Condition<C>> atom) {
+    private static <C> Condition<C> parseUnary(PatternCursor cursor, Function<PatternCursor, Condition<C>> atom,
+                                               boolean keywordOperators) {
         cursor.skipWhitespace();
         if (cursor.consume("(")) {
-            Condition<C> inner = parse(cursor, atom);
+            Condition<C> inner = parse(cursor, atom, keywordOperators);
             cursor.expect(')');
             return inner;
         }

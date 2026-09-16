@@ -52,6 +52,16 @@ final class PatternCursor {
         return false;
     }
 
+    boolean consumeKeyword(String keyword) {
+        int end = position + keyword.length();
+        if (!lookingAt(keyword) || end < text.length()
+                && (Character.isLetterOrDigit(text.charAt(end)) || text.charAt(end) == '_')) {
+            return false;
+        }
+        position = end;
+        return true;
+    }
+
     /** Reads a double-quoted string whose opening quote is next; {@code \"} and {@code \\} are escapes. */
     String quoted() {
         expect('"');

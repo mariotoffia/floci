@@ -1167,9 +1167,14 @@ public class CloudFormationService implements ResourceProvider {
                                 props.isMissingNode() ? null : props,
                                 engine, region, accountId, isCreate);
                     } else {
+                        if (previousResource != null && provisioner.normalizeExistingState(previousResource)) {
+                            persistStack(stack);
+                        }
                         resource = provisioner.provision(logicalId, type, props.isMissingNode() ? null : props,
                                 engine, region, accountId, stack.getStackName(),
-                                resource.getPhysicalId(), resource.getAttributes());
+                                resource.getPhysicalId(), resource.getAttributes(),
+                                event -> addEvent(stack, logicalId, event.getPhysicalResourceId(), type,
+                                        event.getResourceStatus(), event.getResourceStatusReason()));
                     }
                     resource.setUpdateReplacePolicy(
                             resDef.path("UpdateReplacePolicy").asText(null));
@@ -1194,7 +1199,10 @@ public class CloudFormationService implements ResourceProvider {
                     if ("CREATE_FAILED".equals(resource.getStatus())
                             || "UPDATE_FAILED".equals(resource.getStatus())) {
                         failedResource = resource;
-                        if (!isCreate && previousResource != null) {
+                        // A delete-first metric-filter replacement is not already restored:
+                        // keep its attempted identity and full snapshot for the rollback walker.
+                        if (!isCreate && previousResource != null
+                                && !resource.getAttributes().containsKey(CfnRollback.METRIC_FILTER_UPDATE_SNAPSHOT_ATTR)) {
                             // Provisioners work on a copy of the stored resource metadata. Keep the
                             // last known-good identity and status when an update attempt fails so a
                             // later retry or stack deletion still manages the original resource.
@@ -1616,7 +1624,9 @@ public class CloudFormationService implements ResourceProvider {
                             resource.getResourceType(), "UPDATE_FAILED", reason);
                 } else if ("true".equals(resource.getAttributes().remove(
                         CloudFormationResourceProvisioner.UPDATE_ROLLBACK_RESTORED_ATTR))
-                        || provisioner.rollbackUpdate(resource)) {
+                        || provisioner.rollbackUpdate(resource,
+                                event -> addEvent(stack, resource.getLogicalId(), event.getPhysicalResourceId(),
+                                        resource.getResourceType(), event.getResourceStatus(), event.getResourceStatusReason()))) {
                     resource.setStatus(previous.getStatus());
                     resource.setStatusReason(previous.getStatusReason());
                     addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
@@ -1891,10 +1901,13 @@ public class CloudFormationService implements ResourceProvider {
             for (StackResource resource : resources) {
                 // CREATE_COMPLETE/UPDATE_COMPLETE: first delete attempt. DELETE_FAILED: a previous
                 // delete left the resource behind (e.g. the bucket was non-empty); AWS re-attempts
-                // it on retry.
+                // it on retry. Failed updates are included only when their provisioner still
+                // tracks an ownership-aware cleanup obligation.
                 boolean deletable = "CREATE_COMPLETE".equals(resource.getStatus())
                         || "UPDATE_COMPLETE".equals(resource.getStatus())
-                        || "DELETE_FAILED".equals(resource.getStatus());
+                        || "DELETE_FAILED".equals(resource.getStatus())
+                        || ("UPDATE_FAILED".equals(resource.getStatus())
+                                && provisioner.hasPendingRollbackCleanup(resource));
                 if (resource.getPhysicalId() == null || !deletable) {
                     continue;
                 }

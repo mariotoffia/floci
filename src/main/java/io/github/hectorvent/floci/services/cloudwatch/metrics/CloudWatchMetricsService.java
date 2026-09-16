@@ -72,19 +72,48 @@ public class CloudWatchMetricsService {
                 datum.setMaximum(datum.getValue());
             }
 
-            String dimKey = buildDimKey(datum.getDimensions());
-            String key = region + "::" + namespace + "::" + datum.getMetricName()
-                    + "::" + dimKey + "::"
-                    + String.format("%013d", datum.getTimestamp()) + "::" + UUID.randomUUID();
-            if (accountId != null && metricStore instanceof AccountAwareStorageBackend<?> rawAware) {
-                @SuppressWarnings("unchecked")
-                AccountAwareStorageBackend<MetricDatum> aware = (AccountAwareStorageBackend<MetricDatum>) rawAware;
-                aware.putForAccount(accountId, key, datum);
-            } else {
-                metricStore.put(key, datum);
-            }
+            storeDatum(accountId, namespace, datum, region, UUID.randomUUID().toString());
         }
         LOG.debugv("PutMetricData: {0} datums for namespace {1}", datums.size(), namespace);
+    }
+
+    /**
+     * Internal scalar publication, not an AWS PutMetricData operation. The publisher supplies a
+     * canonical account, an explicit event timestamp (including epoch zero), and a stable ID for
+     * this one contribution. Retrying a partially/ambiguously committed write replaces the same
+     * key instead of appending another sample. Distinct contributions must have distinct IDs.
+     * The caller's snapshot is never mutated or retained by the store.
+     */
+    public void publishMetricForAccount(String accountId, String namespace, MetricDatum datum,
+                                        String region, String publicationId) {
+        if (accountId == null || accountId.isBlank() || publicationId == null || publicationId.isBlank()) {
+            throw new IllegalArgumentException("Internal publication requires an explicit account and publication ID");
+        }
+        MetricDatum sample = new MetricDatum();
+        sample.setNamespace(namespace);
+        sample.setMetricName(datum.getMetricName());
+        sample.setUnit(datum.getUnit());
+        sample.setDimensions(List.copyOf(datum.getDimensions()));
+        sample.setTimestamp(datum.getTimestamp());
+        sample.setValue(datum.getValue());
+        sample.setSampleCount(1);
+        sample.setSum(datum.getValue());
+        sample.setMinimum(datum.getValue());
+        sample.setMaximum(datum.getValue());
+        storeDatum(accountId, namespace, sample, region, "publication-" + publicationId);
+    }
+
+    private void storeDatum(String accountId, String namespace, MetricDatum datum, String region, String id) {
+        String key = region + "::" + namespace + "::" + datum.getMetricName()
+                + "::" + buildDimKey(datum.getDimensions()) + "::"
+                + String.format("%013d", datum.getTimestamp()) + "::" + id;
+        if (accountId != null && metricStore instanceof AccountAwareStorageBackend<?> rawAware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<MetricDatum> aware = (AccountAwareStorageBackend<MetricDatum>) rawAware;
+            aware.putForAccount(accountId, key, datum);
+        } else {
+            metricStore.put(key, datum);
+        }
     }
 
     public record MetricIdentity(String namespace, String metricName, List<Dimension> dimensions) {}

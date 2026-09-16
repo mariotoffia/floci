@@ -44,6 +44,9 @@ final class JsonSelector {
         }
         StringBuilder text = new StringBuilder("$");
         cursor.next();
+        if (cursor.peek() != '.') {
+            throw cursor.error("expected '.' after '$'");
+        }
         List<Segment> segments = new ArrayList<>();
         while (!cursor.atEnd() && SELECTOR_END.indexOf(cursor.peek()) < 0) {
             char c = cursor.next();
@@ -60,6 +63,9 @@ final class JsonSelector {
             }
         }
         JsonSelector selector = new JsonSelector(text.toString(), List.copyOf(segments));
+        if (segments.isEmpty()) {
+            throw cursor.error("expected a property name");
+        }
         if (selector.wildcards() > MAX_WILDCARDS) {
             throw cursor.error("at most " + MAX_WILDCARDS + " wildcard is allowed in a property selector");
         }
@@ -68,7 +74,7 @@ final class JsonSelector {
 
     /** Parses a whole reference such as {@code $.latency}, or returns null when it is not a selector. */
     static JsonSelector parse(String reference) {
-        if (reference == null || !reference.startsWith("$.") && !reference.startsWith("$[")) {
+        if (reference == null || !reference.startsWith("$.")) {
             return null;
         }
         try {
@@ -99,7 +105,7 @@ final class JsonSelector {
 
     private static Segment readBracket(PatternCursor cursor, StringBuilder text) {
         Segment segment;
-        if (cursor.peek() == '\'' || cursor.peek() == '"') {
+        if (cursor.peek() == '\'') {
             char quote = cursor.next();
             StringBuilder name = new StringBuilder();
             while (!cursor.atEnd() && cursor.peek() != quote) {
@@ -159,6 +165,21 @@ final class JsonSelector {
             current = next;
         }
         return current;
+    }
+
+    boolean wildcardParentExists(JsonNode root) {
+        List<JsonNode> current = List.of(root);
+        for (Segment segment : segments) {
+            if (segment instanceof Wildcard) {
+                return !current.isEmpty();
+            }
+            List<JsonNode> next = new ArrayList<>();
+            for (JsonNode node : current) {
+                step(node, segment, next);
+            }
+            current = next;
+        }
+        return false;
     }
 
     private static void step(JsonNode node, Segment segment, List<JsonNode> into) {

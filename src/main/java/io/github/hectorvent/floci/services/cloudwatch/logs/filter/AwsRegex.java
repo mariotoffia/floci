@@ -25,10 +25,13 @@ final class AwsRegex {
         if (body.isEmpty()) {
             throw new FilterPatternException("Invalid filter pattern: empty regular expression");
         }
+        boolean characterClass = false;
+        boolean quantifier = false;
         for (int i = 0; i < body.length(); i++) {
             char c = body.charAt(i);
             if (c == '\\') {
                 i = checkEscape(body, i);
+                quantifier = false;
                 continue;
             }
             if (c > 127) {
@@ -38,6 +41,15 @@ final class AwsRegex {
             if (!allowed) {
                 throw new FilterPatternException("Invalid filter pattern: '" + c + "' is not supported in a regular expression");
             }
+            if (c == '[') {
+                characterClass = true;
+            } else if (c == ']') {
+                characterClass = false;
+            }
+            if (!characterClass && c == '+' && quantifier) {
+                throw new FilterPatternException("Invalid filter pattern: possessive quantifiers are not supported");
+            }
+            quantifier = !characterClass && (c == '*' || c == '+' || c == '?' || c == '}');
         }
         try {
             return new AwsRegex(Pattern.compile(body));

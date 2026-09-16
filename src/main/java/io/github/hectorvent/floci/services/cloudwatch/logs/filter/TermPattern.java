@@ -8,8 +8,8 @@ import java.util.Map;
  * Terms matched against an unstructured message: every plain term must be present (a
  * case-sensitive substring, as the API reference's examples show), no {@code -term} may be, and
  * {@code ?term}s make the pattern match when any of them is present, though only when no other
- * kind of term is given, since AWS ignores them otherwise. A quoted phrase is one term, and a
- * {@code %regex%} term is searched for.
+ * kind of term is given, since AWS ignores them otherwise. A quoted phrase is one term.
+ * An unstructured {@code %regex%} must stand alone and is searched for.
  */
 final class TermPattern extends FilterPattern {
 
@@ -29,12 +29,21 @@ final class TermPattern extends FilterPattern {
     static TermPattern of(String text) {
         TermPattern pattern = new TermPattern();
         PatternCursor cursor = new PatternCursor(text);
+        if (cursor.peek() == '%') {
+            pattern.add(new Term(Mode.INCLUDE, null, cursor.regex()));
+            cursor.expectEnd();
+            return pattern;
+        }
         while (true) {
             cursor.skipWhitespace();
             if (cursor.atEnd()) {
                 return pattern;
             }
             pattern.add(readTerm(cursor));
+            if (!cursor.atEnd() && !Character.isWhitespace(cursor.peek())
+                    && cursor.peek() != '-' && cursor.peek() != '?') {
+                throw cursor.error("terms must be separated");
+            }
         }
     }
 
@@ -48,12 +57,20 @@ final class TermPattern extends FilterPattern {
             mode = Mode.OPTIONAL;
         }
         if (cursor.peek() == '"') {
-            return new Term(mode, cursor.quoted(), null);
+            String value = cursor.quoted();
+            if (value.isEmpty()) {
+                throw cursor.error("empty quoted term");
+            }
+            return new Term(mode, value, null);
         }
         if (cursor.peek() == '%') {
-            return new Term(mode, null, cursor.regex());
+            throw cursor.error("a regex must be the entire unstructured pattern");
         }
-        return new Term(mode, cursor.bareValue(""), null);
+        String value = cursor.bareValue("-?");
+        if (!value.matches("[\\p{L}\\p{N}_.]+")) {
+            throw cursor.error("invalid unquoted term '" + value + "'");
+        }
+        return new Term(mode, value, null);
     }
 
     private void add(Term term) {
