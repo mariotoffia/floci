@@ -25,9 +25,20 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullSource;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -165,7 +176,7 @@ class LogsMetricFilterCfnProvisionerTest {
     @Test
     void renameAtCapacityPreservesAllNinetyNineUnrelatedFilters() {
         StackResource r = create(props());
-        Map<String, JsonNode> unrelated = new java.util.LinkedHashMap<>();
+        Map<String, JsonNode> unrelated = new LinkedHashMap<>();
         for (int i = 0; i < 99; i++) {
             String name = "unrelated-" + i;
             create(props().put("FilterName", name));
@@ -327,27 +338,27 @@ class LogsMetricFilterCfnProvisionerTest {
         service.deleteMetricFilter(GROUP, "errors", REGION);
         service = spy(service);
         provisioner = new LogsMetricFilterCfnProvisioner(service);
-        var snapshotRead = new java.util.concurrent.CountDownLatch(1);
-        var otherOwnerCreated = new java.util.concurrent.CountDownLatch(1);
+        CountDownLatch snapshotRead = new CountDownLatch(1);
+        CountDownLatch otherOwnerCreated = new CountDownLatch(1);
         doAnswer(invocation -> {
-            var prior = (java.util.Optional<?>) invocation.callRealMethod();
+            Optional<?> prior = (Optional<?>) invocation.callRealMethod();
             assertTrue(prior.isEmpty(), "A snapshots the externally deleted filter as absent");
             snapshotRead.countDown();
-            assertTrue(otherOwnerCreated.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            assertTrue(otherOwnerCreated.await(5, TimeUnit.SECONDS));
             return prior;
         }).doCallRealMethod().when(service).findMetricFilter(GROUP, "errors", REGION);
         JsonNode expected;
-        try (var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
-            var updateA = executor.submit(() -> assertThrows(AwsException.class,
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<AwsException> updateA = executor.submit(() -> assertThrows(AwsException.class,
                     () -> update(originalOwner, props().put("FilterPattern", "WARN"))));
             try {
-                assertTrue(snapshotRead.await(5, java.util.concurrent.TimeUnit.SECONDS));
+                assertTrue(snapshotRead.await(5, TimeUnit.SECONDS));
                 create(props().put("FilterPattern", "UNRELATED"));
                 expected = MAPPER.valueToTree(filter(GROUP, "errors"));
             } finally {
                 otherOwnerCreated.countDown();
             }
-            assertEquals("AlreadyExistsException", updateA.get(5, java.util.concurrent.TimeUnit.SECONDS).getErrorCode());
+            assertEquals("AlreadyExistsException", updateA.get(5, TimeUnit.SECONDS).getErrorCode());
         }
         JsonNode snapshot = MAPPER.readTree(originalOwner.getAttributes().get(SNAPSHOT));
         assertTrue(snapshot.path("absent").asBoolean());
@@ -604,7 +615,7 @@ class LogsMetricFilterCfnProvisionerTest {
     void legacyCompositeIdentityIsAcceptedOnlyWithLegacyMetadata() {
         StackResource r = create(props().put("FilterName", "old|name"));
         r.setPhysicalId(GROUP + "|old|name");
-        r.setAttributes(new java.util.HashMap<>(Map.of("FlociMetricFilterNameMode", "explicit")));
+        r.setAttributes(new HashMap<>(Map.of("FlociMetricFilterNameMode", "explicit")));
         r.setStatus("CREATE_COMPLETE");
         update(r, props().put("FilterName", "old|name").put("FilterPattern", "WARN"));
         assertEquals("old|name", r.getPhysicalId());
@@ -615,19 +626,19 @@ class LogsMetricFilterCfnProvisionerTest {
 
     @Test
     void concurrentNamedCreatesHaveExactlyOneOwner() throws Exception {
-        var start = new java.util.concurrent.CountDownLatch(1);
-        try (var executor = java.util.concurrent.Executors.newFixedThreadPool(2)) {
-            var first = executor.submit(() -> concurrentCreate(start));
-            var second = executor.submit(() -> concurrentCreate(start));
+        CountDownLatch start = new CountDownLatch(1);
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            Future<Integer> first = executor.submit(() -> concurrentCreate(start));
+            Future<Integer> second = executor.submit(() -> concurrentCreate(start));
             start.countDown();
-            assertEquals(1, first.get(5, java.util.concurrent.TimeUnit.SECONDS)
-                    + second.get(5, java.util.concurrent.TimeUnit.SECONDS));
+            assertEquals(1, first.get(5, TimeUnit.SECONDS)
+                    + second.get(5, TimeUnit.SECONDS));
         }
         assertEquals(List.of("put:errors"), store.operations);
         assertEquals(1, store.keys().size());
     }
 
-    private int concurrentCreate(java.util.concurrent.CountDownLatch start) throws InterruptedException {
+    private int concurrentCreate(CountDownLatch start) throws InterruptedException {
         start.await();
         try {
             create(props());
@@ -641,15 +652,15 @@ class LogsMetricFilterCfnProvisionerTest {
     @Test
     void forwardDeleteAfterEffectCannotRestoreOverAConcurrentCreator() throws Exception {
         StackResource original = create(props());
-        var deleted = new java.util.concurrent.CountDownLatch(1);
+        CountDownLatch deleted = new CountDownLatch(1);
         store.deleteFailureName = "errors";
         store.deleteFault = MutationFault.AFTER;
         store.afterDeleteEffect = deleted::countDown;
         JsonNode otherOwner;
         boolean inspectedWhileLocked;
-        try (var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
-            var creator = executor.submit(() -> {
-                assertTrue(deleted.await(5, java.util.concurrent.TimeUnit.SECONDS));
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<?> creator = executor.submit(() -> {
+                assertTrue(deleted.await(5, TimeUnit.SECONDS));
                 create(props().put("FilterPattern", "UNRELATED"));
                 return null;
             });
@@ -658,7 +669,7 @@ class LogsMetricFilterCfnProvisionerTest {
             } finally {
                 deleted.countDown();
             }
-            creator.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            creator.get(5, TimeUnit.SECONDS);
             inspectedWhileLocked = store.inspectionHeldMonitor;
             otherOwner = MAPPER.valueToTree(filter(GROUP, "errors"));
         }
@@ -679,9 +690,9 @@ class LogsMetricFilterCfnProvisionerTest {
         assertTrue(inspectedWhileLocked, "delete outcome inspection must precede releasing the canonical lock");
     }
 
-    private static java.util.stream.Stream<Arguments> deleteFaultMatrix() {
-        return java.util.stream.Stream.of("forward", "rollback", "stack")
-                .flatMap(phase -> java.util.Arrays.stream(MutationFault.values())
+    private static Stream<Arguments> deleteFaultMatrix() {
+        return Stream.of("forward", "rollback", "stack")
+                .flatMap(phase -> Arrays.stream(MutationFault.values())
                         .map(fault -> Arguments.of(phase, fault)));
     }
 
@@ -760,9 +771,9 @@ class LogsMetricFilterCfnProvisionerTest {
         }
     }
 
-    private static java.util.stream.Stream<Arguments> writeFaultMatrix() {
-        return java.util.stream.Stream.of("create", "update", "restore", "restoreUpdate")
-                .flatMap(phase -> java.util.Arrays.stream(MutationFault.values())
+    private static Stream<Arguments> writeFaultMatrix() {
+        return Stream.of("create", "update", "restore", "restoreUpdate")
+                .flatMap(phase -> Arrays.stream(MutationFault.values())
                         .map(fault -> Arguments.of(phase, fault)));
     }
 
@@ -898,11 +909,11 @@ class LogsMetricFilterCfnProvisionerTest {
     @ValueSource(booleans = {false, true})
     void failedOutcomeRecordingLeavesAConservativeStateForCleanup(boolean storageAlsoFailed) {
         IllegalStateException recordingFailure = new IllegalStateException("metadata sink unavailable");
-        var rejecting = new java.util.concurrent.atomic.AtomicBoolean(true);
+        AtomicBoolean rejecting = new AtomicBoolean(true);
         StackResource resource = new StackResource();
         resource.setLogicalId("Filter");
         resource.setResourceType("AWS::Logs::MetricFilter");
-        resource.setAttributes(new java.util.HashMap<>() {
+        resource.setAttributes(new HashMap<>() {
             @Override
             public String put(String key, String value) {
                 if (rejecting.get() && STATE.equals(key) && value.contains("\"outcome\":\"APPLIED\"")) {
@@ -1067,7 +1078,7 @@ class LogsMetricFilterCfnProvisionerTest {
         }
 
         @Override
-        public java.util.Optional<MetricFilter> get(String key) {
+        public Optional<MetricFilter> get(String key) {
             if (Thread.currentThread() == mutationThread) {
                 inspectionHeldMonitor = Thread.holdsLock(monitor);
                 mutationThread = null;

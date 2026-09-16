@@ -1,14 +1,17 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
-import io.github.hectorvent.floci.core.common.XmlParser;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnRollback;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsMetricFilterService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsMetricFilterService.MutationOutcome;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsMetricFilterService.MutationResult;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.MetricFilter;
+import io.github.hectorvent.floci.services.cloudwatch.logs.model.MetricTransformation;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.mockito.InjectSpy;
@@ -21,16 +24,19 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.params.provider.CsvSource;
 
-import java.util.Map;
-import java.util.List;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
@@ -496,8 +502,8 @@ class CloudFormationLogsMetricFilterIntegrationTest {
             stable.setFilterName("unrelated");
             metricFilterService.putMetricFilter(stable, "us-east-1");
             Map<String, Object> unrelated = backingFilter(group, "unrelated");
-            var otherOwner = new java.util.concurrent.atomic.AtomicReference<MetricFilter>();
-            var armed = new java.util.concurrent.atomic.AtomicBoolean(true);
+            AtomicReference<MetricFilter> otherOwner = new AtomicReference<>();
+            AtomicBoolean armed = new AtomicBoolean(true);
             doAnswer(invocation -> {
                 String requestedGroup = invocation.getArgument(0);
                 String requestedName = invocation.getArgument(1);
@@ -536,7 +542,7 @@ class CloudFormationLogsMetricFilterIntegrationTest {
                     : "__FlociMetricFilterState";
             String metadata = resource.getAttributes().get(metadataKey);
             assertNotNull(metadata);
-            var state = mapper.readTree(metadata);
+            JsonNode state = mapper.readTree(metadata);
             if ("forward".equals(phase)) {
                 state = state.path("prior");
             }
@@ -589,7 +595,7 @@ class CloudFormationLogsMetricFilterIntegrationTest {
             cloudFormation(stack, "CreateStack", TEMPLATE.formatted(group, suffix, ""),
                     Map.of("FilterName", "old", "Pattern", "WARN"));
             describeStacks(stack, "CREATE_COMPLETE");
-            var originalStack = cloudFormationService.describeStacks(stack, "us-east-1").getFirst();
+            Stack originalStack = cloudFormationService.describeStacks(stack, "us-east-1").getFirst();
             StackResource original = originalStack.getResources().get("Filter");
             makeLegacyIdentity(original, group, "DELETE_FAILED");
             originalStack.setStatus("DELETE_FAILED");
@@ -598,7 +604,7 @@ class CloudFormationLogsMetricFilterIntegrationTest {
             b.setLogGroupName(group);
             b.setFilterName("old");
             b.setFilterPattern("UNRELATED");
-            var transformation = new io.github.hectorvent.floci.services.cloudwatch.logs.model.MetricTransformation();
+            MetricTransformation transformation = new MetricTransformation();
             transformation.setMetricName("OtherOwner");
             transformation.setMetricNamespace("Other/" + suffix);
             transformation.setMetricValue("7");
@@ -661,7 +667,7 @@ class CloudFormationLogsMetricFilterIntegrationTest {
     }
 
     private static void makeLegacyIdentity(StackResource resource, String group, String status) {
-        resource.setAttributes(new java.util.HashMap<>(Map.of(
+        resource.setAttributes(new HashMap<>(Map.of(
                 "__FlociMetricFilterLogGroupName", group, "FlociMetricFilterNameMode", "explicit")));
         resource.setStatus(status);
     }

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.MissingNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -16,6 +17,7 @@ import io.github.hectorvent.floci.services.cloudwatch.logs.model.MetricTransform
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -515,7 +517,7 @@ public class LogsMetricFilterCfnProvisioner implements CfnResourceProvisioner {
             return result;
         }
         if (node.isArray()) {
-            var result = MAPPER.createArrayNode();
+            ArrayNode result = MAPPER.createArrayNode();
             node.forEach(item -> result.add(markNoValue(item)));
             return result;
         }
@@ -533,7 +535,7 @@ public class LogsMetricFilterCfnProvisioner implements CfnResourceProvisioner {
             return result;
         }
         if (node != null && node.isArray()) {
-            var result = MAPPER.createArrayNode();
+            ArrayNode result = MAPPER.createArrayNode();
             node.forEach(item -> {
                 if (!item.isMissingNode()) {
                     result.add(pruneNoValue(item));
@@ -573,7 +575,7 @@ public class LogsMetricFilterCfnProvisioner implements CfnResourceProvisioner {
             if (!fields.isArray()) {
                 throw invalid("EmitSystemFieldDimensions must be an array");
             }
-            var values = new java.util.ArrayList<String>();
+            List<String> values = new ArrayList<>();
             for (JsonNode field : fields) {
                 if (!field.isTextual()) {
                     throw invalid("EmitSystemFieldDimensions entries must be strings");

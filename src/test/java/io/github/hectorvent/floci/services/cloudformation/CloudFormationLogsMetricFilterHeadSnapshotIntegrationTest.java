@@ -23,9 +23,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -169,12 +171,12 @@ class CloudFormationLogsMetricFilterHeadSnapshotIntegrationTest {
 
     private void seedAndReload(String variant) throws Exception {
         String raw;
-        try (var input = getClass().getResourceAsStream("/cloudformation/metric-filter-head-" + variant + ".json")) {
+        try (InputStream input = getClass().getResourceAsStream("/cloudformation/metric-filter-head-" + variant + ".json")) {
             assertNotNull(input);
             raw = new String(input.readAllBytes(), StandardCharsets.UTF_8).trim();
         }
         originalSnapshot = mapper.readTree(raw);
-        Set<String> fields = new java.util.HashSet<>();
+        Set<String> fields = new HashSet<>();
         originalSnapshot.fieldNames().forEachRemaining(fields::add);
         assertEquals(Set.of("region", "logGroupName", "filterName", variant), fields);
         assertEquals(FILTER, originalSnapshot.path("filterName").asText());

@@ -4,6 +4,8 @@ import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsS
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.mockito.InjectSpy;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.QuarkusTestProfile;
+import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
@@ -21,7 +23,11 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 @QuarkusTest
+@TestProfile(CloudWatchLogsMetricFilterRetryIntegrationTest.ResetIsolationProfile.class)
 class CloudWatchLogsMetricFilterRetryIntegrationTest {
+    /** HTTP reset wipes every service; do not share this application with other test classes. */
+    public static class ResetIsolationProfile implements QuarkusTestProfile {}
+
     @InjectSpy CloudWatchMetricsService metrics;
     @Inject CloudWatchLogsMetricFilterService publications;
     private static final String AUTH = "AWS4-HMAC-SHA256 Credential=AKID/20260916/eu-west-1/logs/aws4_request";
