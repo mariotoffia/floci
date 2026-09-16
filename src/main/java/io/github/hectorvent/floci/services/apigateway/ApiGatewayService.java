@@ -1,6 +1,10 @@
 package io.github.hectorvent.floci.services.apigateway;
 
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -10,6 +14,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 import io.github.hectorvent.floci.services.apigateway.model.EndpointConfiguration;
 import io.github.hectorvent.floci.services.apigateway.model.EndpointType;
@@ -54,6 +59,15 @@ import jakarta.inject.Inject;
 
 @ApplicationScoped
 public class ApiGatewayService {
+
+    /** Documented default page size for GetUsage. */
+    private static final int DEFAULT_USAGE_LIMIT = 25;
+    /**
+     * Documented maximum results per page. A larger {@code limit} is accepted, as real API Gateway
+     * accepts one, but the page returned is still capped here.
+     */
+    private static final int MAX_USAGE_PAGE_SIZE = 500;
+
 
     private static final Logger LOG = Logger.getLogger(ApiGatewayService.class);
 
@@ -378,6 +392,61 @@ public class ApiGatewayService {
 
     // ──────────────────────────── Method CRUD ────────────────────────────
 
+    /**
+     * The character set API Gateway allows in a method request parameter name. Measured against real
+     * AWS (us-west-2): {@code PutMethod} and an OpenAPI import both reject anything outside it with
+     * {@link #PARAMETER_NAME_ERROR}, quoting this exact expression. {@code $ : . _ -} are allowed,
+     * so {@code filter.a} imports; brackets are not, so a JSON:API style {@code filter[a]} does not.
+     *
+     * <p>This limitation is undocumented, and the runtime behaves differently: a request carrying
+     * {@code ?filter[a]=1} reaches a Lambda proxy integration with the brackets intact. Only the
+     * declared parameter name is restricted.
+     */
+    private static final Pattern REQUEST_PARAMETER_NAME = Pattern.compile("^[a-zA-Z0-9:._$-]+$");
+
+    private static final String PARAMETER_NAME_ERROR =
+            "Invalid mapping expression specified: Validation Result: warnings : [], errors : "
+                    + "[Parameter name should match the following regular expression: ^[a-zA-Z0-9:._$-]+$]";
+
+    private static final List<String> REQUEST_PARAMETER_PREFIXES = List.of(
+            "method.request.querystring.", "method.request.header.", "method.request.path.");
+
+    /**
+     * Rethrows a parameter-name rejection using the envelope an import reports it under. Direct
+     * {@code PutMethod} surfaces the bare message; {@code ImportRestApi}/{@code PutRestApi} name the
+     * method and path first, both measured against real AWS.
+     */
+    private static AwsException importParameterNameFailure(String httpMethod, String path, AwsException cause) {
+        return new AwsException("BadRequestException",
+                "Errors found during import:\tUnable to put method '" + httpMethod
+                        + "' on resource at path '" + path + "': " + cause.getMessage(),
+                400);
+    }
+
+    /**
+     * Validates the names in a method's {@code requestParameters} map, which are of the form
+     * {@code method.request.<location>.<name>}. A name may itself contain dots ({@code filter.a}),
+     * so everything after the location prefix is the name. Keys that do not carry a recognised
+     * prefix are left alone: AWS rejects those with a different message that is not measured here.
+     *
+     * @throws AwsException if any parameter name falls outside {@link #REQUEST_PARAMETER_NAME}
+     */
+    private static void validateRequestParameterNames(Map<String, ?> requestParameters) {
+        if (requestParameters == null) return;
+        for (String key : requestParameters.keySet()) {
+            if (key == null) continue;
+            for (String prefix : REQUEST_PARAMETER_PREFIXES) {
+                if (key.startsWith(prefix)) {
+                    String name = key.substring(prefix.length());
+                    if (!REQUEST_PARAMETER_NAME.matcher(name).matches()) {
+                        throw new AwsException("BadRequestException", PARAMETER_NAME_ERROR, 400);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     public MethodConfig putMethod(String region, String apiId, String resourceId, String httpMethod, Map<String, Object> request) {
         ApiGatewayResource resource = getResource(region, apiId, resourceId);
         MethodConfig method = new MethodConfig();
@@ -389,6 +458,7 @@ public class ApiGatewayService {
 
         @SuppressWarnings("unchecked")
         Map<String, Boolean> reqParams = (Map<String, Boolean>) request.get("requestParameters");
+        validateRequestParameterNames(reqParams);
         if (reqParams != null) method.setRequestParameters(reqParams);
 
         @SuppressWarnings("unchecked")
@@ -1207,6 +1277,115 @@ public class ApiGatewayService {
     public UsagePlanKey getUsagePlanKey(String region, String usagePlanId, String keyId) {
         return usagePlanKeyStore.get(usagePlanKeyPathKey(region, usagePlanId, keyId))
                 .orElseThrow(() -> new AwsException("NotFoundException", "Usage Plan Key not found", 404));
+    }
+
+    /**
+     * Builds a {@code GetUsage} report for a usage plan.
+     *
+     * <p>Shape measured against real API Gateway: the envelope carries {@code usagePlanId},
+     * {@code startDate}, {@code endDate} and an {@code items} map of API key id to one
+     * {@code [used, remaining]} pair per day of the inclusive range. {@code position} is absent
+     * when there is no further page, which is what stops a caller's pagination loop.
+     *
+     * <p><strong>Both numbers are zero.</strong> Nothing counts requests per API key, and a
+     * {@link UsagePlan} carries no quota, so there is no limit to subtract from. Storing a quota on
+     * the usage plan and counting on the execute path are the two pieces still missing; this method
+     * is where they would surface.
+     */
+    public UsageReport getUsage(String region, String usagePlanId, String startDate, String endDate,
+                                String keyId, Integer limit, String position) {
+        // Resolving the plan first gives the same NotFoundException an unknown id gets on AWS.
+        getUsagePlan(region, usagePlanId);
+
+        LocalDate start = parseUsageDate(startDate, "startDate");
+        LocalDate end = parseUsageDate(endDate, "endDate");
+        if (end.isBefore(start)) {
+            throw new AwsException("BadRequestException", "Usage end date must be after start date", 400);
+        }
+        int days = (int) ChronoUnit.DAYS.between(start, end) + 1;
+        int pageSize = resolveUsageLimit(limit);
+
+        List<UsagePlanKey> keys = getUsagePlanKeys(region, usagePlanId).stream()
+                .filter(key -> keyId == null || keyId.isBlank() || keyId.equals(key.getId()))
+                .sorted(Comparator.comparing(UsagePlanKey::getId))
+                .toList();
+
+        // The page token is the last key id already returned, so a page resumes after it rather
+        // than at a positional offset a concurrent key attachment could shift. Measured: an
+        // unrecognised token is a BadRequestException, not an empty page.
+        int from = 0;
+        if (position != null && !position.isBlank()) {
+            int previous = -1;
+            for (int i = 0; i < keys.size(); i++) {
+                if (position.equals(keys.get(i).getId())) {
+                    previous = i;
+                    break;
+                }
+            }
+            if (previous < 0) {
+                throw new AwsException("BadRequestException", "Invalid position parameter", 400);
+            }
+            from = previous + 1;
+        }
+
+        List<UsagePlanKey> page = keys.subList(Math.min(from, keys.size()),
+                Math.min(from + pageSize, keys.size()));
+        boolean more = from + pageSize < keys.size();
+
+        Map<String, List<long[]>> items = new LinkedHashMap<>();
+        for (UsagePlanKey key : page) {
+            List<long[]> perDay = new ArrayList<>();
+            for (int day = 0; day < days; day++) {
+                // [used, remaining]: nothing is metered, and no quota is stored to subtract from.
+                perDay.add(new long[] {0L, 0L});
+            }
+            items.put(key.getId(), perDay);
+        }
+        // A token only when another page exists; its absence is what ends a caller's loop.
+        String next = more && !page.isEmpty() ? page.get(page.size() - 1).getId() : null;
+        return new UsageReport(usagePlanId, start.toString(), end.toString(), items, next);
+    }
+
+    /**
+     * Resolves the effective page size, which is not the same thing as accepting the request.
+     *
+     * <p>Request acceptance and response page size are separate. Probed against real API Gateway,
+     * every {@code limit} from 500 up to {@link Integer#MAX_VALUE} is accepted without error, so
+     * none is rejected here either. What that probe does <em>not</em> establish is that the service
+     * ever returns more than 500 entries in one page, and the documented contract says 500 is the
+     * maximum number of results per page. The effective page is therefore capped at 500 until a
+     * real result with more than 500 keys shows otherwise.
+     *
+     * <p>The lower bound is a deliberate divergence: real API Gateway answers {@code limit=0} and
+     * {@code limit=-1} with an {@code InternalFailure}, which is a fault rather than a contract, so
+     * a page size below one is rejected as a bad request instead of reproducing a 500.
+     */
+    static int resolveUsageLimit(Integer limit) {
+        if (limit == null) {
+            return DEFAULT_USAGE_LIMIT;
+        }
+        if (limit < 1) {
+            throw new AwsException("BadRequestException", "Invalid limit parameter", 400);
+        }
+        return Math.min(limit, MAX_USAGE_PAGE_SIZE);
+    }
+
+    /**
+     * One {@code GetUsage} report: {@code items} maps an API key id to its per-day pairs, and
+     * {@code position} is the continuation token, absent on the terminal page.
+     */
+    public record UsageReport(String usagePlanId, String startDate, String endDate,
+                              Map<String, List<long[]>> items, String position) {}
+
+    private static LocalDate parseUsageDate(String value, String field) {
+        if (value == null || value.isBlank()) {
+            throw new AwsException("BadRequestException", field + " is required", 400);
+        }
+        try {
+            return LocalDate.parse(value);
+        } catch (DateTimeParseException e) {
+            throw new AwsException("BadRequestException", field + " must be a date of the form YYYY-MM-DD", 400);
+        }
     }
 
     public List<UsagePlanKey> getUsagePlanKeys(String region, String usagePlanId) {
@@ -2671,8 +2850,15 @@ public class ApiGatewayService {
             if (operations != null) {
                 for (var opEntry : operations.entrySet()) {
                     String httpMethod = opEntry.getKey().name().toUpperCase();
-                    applyOperation(region, apiId, resourceId, httpMethod, opEntry.getValue(), openAPI,
-                            schemeToAuthorizerId, schemeToAuthType, validatorNameToId);
+                    try {
+                        applyOperation(region, apiId, resourceId, httpMethod, opEntry.getValue(), openAPI,
+                                schemeToAuthorizerId, schemeToAuthType, validatorNameToId);
+                    } catch (AwsException e) {
+                        if (PARAMETER_NAME_ERROR.equals(e.getMessage())) {
+                            throw importParameterNameFailure(httpMethod, path, e);
+                        }
+                        throw e;
+                    }
                 }
             }
 
@@ -2687,8 +2873,15 @@ public class ApiGatewayService {
                     try {
                         Operation anyOperation = io.swagger.v3.core.util.Json.mapper()
                                 .convertValue(anyMethodExt, Operation.class);
-                        applyOperation(region, apiId, resourceId, "ANY", anyOperation, openAPI,
-                                schemeToAuthorizerId, schemeToAuthType, validatorNameToId);
+                        try {
+                            applyOperation(region, apiId, resourceId, "ANY", anyOperation, openAPI,
+                                    schemeToAuthorizerId, schemeToAuthType, validatorNameToId);
+                        } catch (AwsException e) {
+                            if (PARAMETER_NAME_ERROR.equals(e.getMessage())) {
+                                throw importParameterNameFailure("ANY", path, e);
+                            }
+                            throw e;
+                        }
                     } catch (IllegalArgumentException e) {
                         throw new AwsException("BadRequestException",
                                 "Invalid x-amazon-apigateway-any-method definition for path " + path + ": "

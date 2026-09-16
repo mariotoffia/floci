@@ -53,7 +53,7 @@ duplicate override IDs.
 | **Stages** | CreateStage, GetStage, GetStages, UpdateStage, DeleteStage |
 | **Authorizers** | CreateAuthorizer, GetAuthorizer, GetAuthorizers, UpdateAuthorizer, DeleteAuthorizer |
 | **API Keys** | CreateApiKey, ImportApiKeys, GetApiKey, GetApiKeys, UpdateApiKey, DeleteApiKey |
-| **Usage Plans** | CreateUsagePlan, GetUsagePlan, GetUsagePlans, UpdateUsagePlan, DeleteUsagePlan |
+| **Usage Plans** | CreateUsagePlan, GetUsagePlan, GetUsagePlans, UpdateUsagePlan, DeleteUsagePlan, GetUsage |
 | **Usage Plan Keys** | CreateUsagePlanKey, GetUsagePlanKey, GetUsagePlanKeys, DeleteUsagePlanKey |
 | **Request Validators** | CreateRequestValidator, GetRequestValidator, GetRequestValidators, UpdateRequestValidator, DeleteRequestValidator |
 | **Gateway Responses** | PutGatewayResponse, GetGatewayResponse, GetGatewayResponses, UpdateGatewayResponse, DeleteGatewayResponse |
@@ -303,6 +303,32 @@ aws apigateway create-deployment \
 curl http://localhost:4566/restapis/$API_ID/dev/_user_request_/users
 ```
 
+### Usage reporting
+
+`GetUsage` returns the real response envelope: a `values` map of API key id to one `[used, remaining]`
+pair per day of the inclusive range, alongside `usagePlanId`, `startDate` and `endDate`. The second
+element of each pair is the quota limit minus cumulative use on real API Gateway, not the quota
+itself.
+
+The operation pages over the API key entries with `limit` and `position`, defaulting to 25 keys a
+page and emitting `position` only when another page exists.
+
+Request acceptance and response page size are separate things here. Probed against real API
+Gateway, every `limit` from 500 up to `Integer.MAX_VALUE` is accepted without error, so none is
+rejected. That does not show the service ever returning more than 500 entries in one page, and the
+documented contract caps a page at 500, so a larger `limit` is honoured as a request while the page
+returned stays capped at 500.
+
+The lower bound is a deliberate divergence: real API Gateway answers `limit=0` and `limit=-1` with
+an `InternalFailure`, which is a fault rather than a contract, so a page size below one is rejected
+as a `BadRequestException` instead of reproducing a 500.
+
+**Both numbers are always zero.** Nothing meters requests per API key, and a usage plan stores no
+quota to subtract from, so there is no limit to report against. Throttle settings are likewise
+accepted and stored but never enforced. Storing a quota on the usage plan and counting on the
+execute path are the two pieces still missing; a caller that sums the used counts gets zero, which
+is what it already got before the action existed, without having to special-case a missing endpoint.
+
 ### Usage Plan Tags and Custom IDs
 
 Usage plans accept arbitrary tags, and the same reserved `floci:override-id` tag used for
@@ -332,6 +358,19 @@ setups, and `floci:override-id` wins when both are present. Every other tag is p
 |---|---|---|
 | `FLOCI_SERVICES_APIGATEWAY_ENABLED` | `true` | Enable or disable API Gateway v1 (REST APIs) |
 | `FLOCI_SERVICES_APIGATEWAYV2_ENABLED` | `true` | Enable or disable API Gateway v2 (HTTP and WebSocket APIs) |
+| `FLOCI_SERVICES_APIGATEWAY_VTL_MAX_LOOPS` | `10000` | Maximum `#foreach` iterations a VTL mapping template may execute |
+| `FLOCI_SERVICES_APIGATEWAY_VTL_MAX_OUTPUT_CHARS` | `1048576` | Maximum characters a VTL mapping template may render |
+| `FLOCI_SERVICES_APIGATEWAY_VTL_TIMEOUT_MILLIS` | `5000` | Maximum wall-clock time a VTL mapping template may spend evaluating |
+
+VTL (Velocity Template Language) mapping templates render inside a reflection-restricted sandbox
+(`SecureUberspector`, with `Class`, `ClassLoader`, `Runtime`, `ProcessBuilder`, `System`, `Thread`,
+`java.io.File` and related classes/packages blocked) and are subject to the three limits above.
+The loop cap truncates a `#foreach` at the configured iteration count and lets the template finish
+rendering with whatever output it produced up to that point; it does not fail the template.
+Exceeding the output-size or execution-time limit does fail the template, the same way any other
+Velocity evaluation error does; neither introduces a new error shape. This applies to both API
+Gateway v1 (`AWS`/Lambda mapping templates) and the AppSync resolver templates described in
+[appsync.md](appsync.md).
 
 ## API Gateway v2 (HTTP and WebSocket APIs) {#v2}
 
