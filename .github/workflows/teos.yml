@@ -1,0 +1,147 @@
+name: Teos
+
+# Rebuilds the teos branch as floci-io/floci main plus every open pull request by
+# mariotoffia, lowest number first, then the other authors' pull requests listed in
+# .github/teos-extra-prs.txt, then builds and pushes mariotoffia/floci images.
+#
+# Runs LOCALLY with act only, from a plain clone of the fork's teos branch:
+#
+#   make teos               this machine's architecture only
+#   make teos MULTIARCH=1   linux/amd64 and linux/arm64 (slow: the other one is emulated)
+#
+# Needs a .env file in that clone with DOCKERHUB_TOKEN=<Docker Hub access token>.
+# It never runs in GitHub's cloud: the fork's default branch (main) has no copy of
+# this file, and the first step refuses to run outside act.
+#
+# Plain git does the merging. A pull request that edits the same lines as an earlier
+# one stops the run and is named in the error: start its branch from that earlier
+# pull request's branch instead of main, then rerun. The append-only CloudFormation
+# registries (resource-type TSV, provisioner fixture, docs table) merge with union instead.
+#
+# Tags: mariotoffia/floci:latest and :YYYYMMDD (.2, .3 ... for more builds the same
+# day), each with a -compat twin (AWS CLI and boto3 included, like floci/floci).
+
+on:
+  workflow_dispatch:
+
+env:
+  IMAGE: mariotoffia/floci
+
+jobs:
+  teos:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse to run in GitHub's cloud
+        run: test "${ACT:-}" = true || { echo "::error::Teos runs locally with act only"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Assemble teos from upstream main and open pull requests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tooling="$(git rev-parse HEAD)"
+          git config user.name teos
+          git config user.email teos@users.noreply.github.com
+          git remote add upstream https://github.com/floci-io/floci.git 2>/dev/null || true
+          git fetch -q upstream main
+          git checkout -q -B teos upstream/main
+          # ponytail: every CFN provisioner PR appends to these registries; union keeps both sides' lines.
+          # Ceiling: a line both sides *edit* is kept twice; the fixture then fails to compile, loudly.
+          printf '%s merge=union\n' docs/services/cloudformation.md \
+            src/test/resources/cloudformation/supported-resource-types.tsv '**/CfnProvisionerFixture.java' > .git/info/attributes
+
+          curl -fsSL "https://api.github.com/repos/floci-io/floci/pulls?state=open&per_page=100" \
+            | jq -r '[.[] | select(.user.login == "mariotoffia")] | sort_by(.number)[] | "#\(.number)\t\(.title)"' > /tmp/prs.tsv
+          git show "$tooling:.github/teos-extra-prs.txt" | sed -E '/^[[:space:]]*(#|$)/d; s/[[:space:]]+/\t/' >> /tmp/prs.tsv
+
+          merged=""
+          while IFS=$'\t' read -r ref title; do
+            echo "::group::$ref $title"
+            repo="${ref%#*}"
+            git fetch -q "https://github.com/${repo:-floci-io/floci}.git" "pull/${ref##*#}/head"
+            if ! git merge --no-ff -m "teos: merge $ref $title" FETCH_HEAD; then
+              echo "::error::$ref changes the same lines as an earlier pull request (${merged:-none}) in: $(git diff --name-only --diff-filter=U | paste -sd ' ' -). Start its branch from that pull request's branch instead of main, then rerun."
+              exit 1
+            fi
+            merged="${merged:+$merged, }$ref"
+            echo "::endgroup::"
+          done < /tmp/prs.tsv
+
+          pip3 install -q --root-user-action=ignore --break-system-packages pyyaml
+          python3 tools/docs/regen_cfn_resource_types.py
+          git diff --quiet || git commit -qam "teos: regenerate CloudFormation resource docs"
+          git checkout "$tooling" -- .github/workflows/teos.yml .github/teos-extra-prs.txt .actrc GNUmakefile
+          git commit -q -m "ci: teos tooling"
+          git push --force "https://x-access-token:$GH_TOKEN@github.com/mariotoffia/floci.git" teos
+          git push "https://x-access-token:$GH_TOKEN@github.com/mariotoffia/floci.git" upstream/main:refs/heads/main
+          echo "teos = floci-io/floci main $(git rev-parse --short upstream/main) + $(sed 's/\t.*//' /tmp/prs.tsv | paste -sd ' ' -)"
+
+      - name: Log in to Docker Hub
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: docker login -u mariotoffia --password-stdin <<< "$DOCKERHUB_TOKEN"
+
+      - name: Build and push native and compat images
+        env:
+          MULTIARCH: ${{ env.MULTIARCH }}
+        run: |
+          set -euo pipefail
+          day="$(date -u +%Y%m%d)"
+          builds_today="$(curl -fsSL "https://hub.docker.com/v2/repositories/$IMAGE/tags?name=$day&page_size=100" \
+            | jq --arg day "$day" '[.results[].name | select(test("^" + $day + "(\\.[0-9]+)?$"))] | length' || echo 0)"
+          tag="$day"
+          [[ "$builds_today" -eq 0 ]] || tag="$day.$((builds_today + 1))"
+          # ponytail: MULTIARCH builds amd64 under Rosetta/QEMU on an arm64 Mac; slow (30+ min), so give
+          # Docker Desktop 12 GB or more. GitHub runners if it hurts.
+          platforms=("linux/$(docker version --format '{{.Server.Arch}}')")
+          [[ -z "${MULTIARCH:-}" ]] || platforms=(linux/amd64 linux/arm64)
+          # Same shape as release.yml: compile with Dockerfile.native's build stage, stage the binary under
+          # native/<arch>/application, package with Dockerfile.native-package. Dockerfile.compat needs that
+          # ubi9-minimal base (microdnf); Dockerfile.native's own runtime is quarkus-micro-image, no package manager.
+          for p in "${platforms[@]}"; do
+            arch="${p#linux/}"
+            docker buildx build --platform "$p" --target build --load -t "floci-native-build:$arch" -f docker/Dockerfile.native .
+            # The Mandrel builder has no libz.a, so the binary links zlib dynamically and ubi9-micro has no
+            # libz.so.1. Stage it beside the binary, where Dockerfile.native-package's LD_LIBRARY_PATH finds
+            # it, as upstream's make native does.
+            printf 'FROM floci-native-build:%s AS build\nFROM scratch\nCOPY --from=build /app/target/*-runner /application\nCOPY --from=build /usr/lib64/libz.so.1 /libz.so.1\n' "$arch" \
+              | docker buildx build --platform "$p" --output "type=local,dest=native/$arch" -
+          done
+          # Boot every image before publishing it. A runtime base that lacks a library the binary is
+          # dynamically linked against builds and pushes cleanly and then exits 127 the moment it runs,
+          # which is how :latest shipped dead: the compile above uses the Mandrel builder, which has no
+          # libz.a, so native-image links zlib dynamically, while the CI runners upstream compiles on
+          # have the static library and never produce such a binary. Each image is loaded and started
+          # on its own platform; under MULTIARCH the foreign one runs emulated, like its compile above.
+          smoke() {
+            docker rm -f floci-smoke >/dev/null 2>&1 || true
+            docker run -d --name floci-smoke "$1" >/dev/null
+            local s=
+            for _ in $(seq 1 120); do
+              s="$(docker inspect -f '{{.State.Running}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' floci-smoke)"
+              [[ "$s" == */healthy ]] && break
+              [[ "$s" == true/* ]] || break
+              sleep 1
+            done
+            if [[ "$s" != */healthy ]]; then
+              echo "::error::$1 did not report healthy ($s, exit $(docker inspect -f '{{.State.ExitCode}}' floci-smoke))"
+              docker logs floci-smoke 2>&1 | tail -30
+              docker rm -f floci-smoke >/dev/null 2>&1 || true
+              exit 1
+            fi
+            docker rm -f floci-smoke >/dev/null
+            echo "$1 started and reported healthy"
+          }
+          for p in "${platforms[@]}"; do
+            arch="${p#linux/}"
+            docker buildx build --load --platform "$p" -f docker/Dockerfile.native-package --build-arg VERSION="$tag" -t "floci-smoke:$arch" .
+            smoke "floci-smoke:$arch"
+            docker build --platform "$p" -t "floci-smoke:$arch-compat" --build-arg VERSION="$tag" --build-arg BASE_IMAGE="floci-smoke:$arch" -f docker/Dockerfile.compat .
+            smoke "floci-smoke:$arch-compat"
+          done
+          platform="$(IFS=,; echo "${platforms[*]}")"
+          docker buildx build --push --platform "$platform" -f docker/Dockerfile.native-package --build-arg VERSION="$tag" -t "$IMAGE:$tag" -t "$IMAGE:latest" .
+          docker buildx build --push --platform "$platform" -f docker/Dockerfile.compat --build-arg BASE_IMAGE="$IMAGE:$tag" -t "$IMAGE:$tag-compat" -t "$IMAGE:latest-compat" .
+          echo "Pushed $IMAGE:$tag and $IMAGE:$tag-compat (also :latest and :latest-compat) for $platform"
