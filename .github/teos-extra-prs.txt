@@ -1,0 +1,5 @@
+# Pull requests by other authors that teos merges after floci-io/floci main and
+# mariotoffia's open pull requests, top to bottom. One per line: owner/repo#number
+# (floci-io/floci#N for one opened upstream), then why. Delete a line once
+# floci-io/floci main has the change.
+allensanborn/floci#44 fix(apigateway): custom domains under *.localhost answered by S3 (floci-io/floci#4827, TEOS task 8.2). Waiting for it to merge into floci-io/floci main
