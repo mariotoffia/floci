@@ -5,8 +5,11 @@ import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.mockito.InjectSpy;
 import io.restassured.response.ValidatableResponse;
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
 
 import static io.restassured.RestAssured.given;
@@ -59,6 +62,8 @@ class CloudFormationDynamoDbTimeToLiveIntegrationTest {
             ",\n\"TimeToLiveSpecification\": {\"Enabled\": true}";
     private static final String TTL_WITHOUT_ENABLED =
             ",\n\"TimeToLiveSpecification\": {\"AttributeName\": \"expiresAt\"}";
+    private static final String TTL_NO_VALUE =
+            ",\n\"TimeToLiveSpecification\": {\"Ref\": \"AWS::NoValue\"}";
     private static final String STREAMED =
             ",\n\"StreamSpecification\": {\"StreamViewType\": \"NEW_AND_OLD_IMAGES\"}";
 
@@ -104,8 +109,10 @@ class CloudFormationDynamoDbTimeToLiveIntegrationTest {
         deleteStack(stack);
     }
 
-    @Test
-    void removingTheTimeToLiveBlockDisablesIt() {
+    /** Dropping the block and setting it to {@code AWS::NoValue} both remove it. */
+    @ParameterizedTest
+    @ValueSource(strings = {"", TTL_NO_VALUE})
+    void removingTheTimeToLiveBlockDisablesIt(String removed) {
         String suffix = Long.toString(System.nanoTime(), 36);
         String stack = "cfn-ddb-ttl-rm-" + suffix;
         String table = "ttl-rm-table-" + suffix;
@@ -114,7 +121,7 @@ class CloudFormationDynamoDbTimeToLiveIntegrationTest {
         assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack, CFN_AUTH).status());
         describeTimeToLive(table).body("TimeToLiveDescription.TimeToLiveStatus", equalTo("ENABLED"));
 
-        cloudFormation(stack, "UpdateStack", TEMPLATE.formatted(table, "dev", "", ""));
+        cloudFormation(stack, "UpdateStack", TEMPLATE.formatted(table, "dev", removed, ""));
         assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(stack, CFN_AUTH).status());
         describeTimeToLive(table).body("TimeToLiveDescription.TimeToLiveStatus", equalTo("DISABLED"));
 
@@ -290,6 +297,53 @@ class CloudFormationDynamoDbTimeToLiveIntegrationTest {
         deleteStack(stack);
     }
 
+    /**
+     * A replacing update whose new table fails and cannot be deleted ends UPDATE_ROLLBACK_FAILED.
+     * Retrying that rollback must not put the table back to its state before the last committed
+     * update, which an in-place update's snapshot left on the resource would do.
+     */
+    @Test
+    void retryingAFailedReplacementRollbackKeepsTheCommittedTags() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stack = "cfn-ddb-ttl-cur-" + suffix;
+        String table = "ttl-cur-table-" + suffix;
+        String replacement = "ttl-cur-new-" + suffix;
+
+        cloudFormation(stack, "CreateStack", TEMPLATE.formatted(table, "dev", "", ""));
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack, CFN_AUTH).status());
+        cloudFormation(stack, "UpdateStack", TEMPLATE.formatted(table, "prod", "", ""));
+        assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(stack, CFN_AUTH).status());
+        String tableArn = dynamoDb("DescribeTable", "{\"TableName\": \"" + table + "\"}")
+            .statusCode(200)
+            .extract().path("Table.TableArn");
+
+        failNextUpdateTimeToLive();
+        Mockito.doThrow(new IllegalStateException("simulated DeleteTable failure"))
+                .doCallRealMethod()
+                .when(dynamoDbService)
+                .deleteTable(anyString(), anyString());
+        try {
+            cloudFormation(stack, "UpdateStack", TEMPLATE.formatted(replacement, "prod", TTL_ENABLED, ""));
+            assertEquals("UPDATE_ROLLBACK_FAILED", CfnStackWaits.awaitTerminal(stack, CFN_AUTH).status());
+
+            continueUpdateRollback(stack);
+            assertEquals("UPDATE_ROLLBACK_FAILED", CfnStackWaits.awaitTerminal(stack, CFN_AUTH).status());
+        } finally {
+            Mockito.doCallRealMethod().when(dynamoDbService)
+                    .updateTimeToLive(anyString(), anyString(), anyBoolean(), anyString());
+            Mockito.doCallRealMethod().when(dynamoDbService).deleteTable(anyString(), anyString());
+        }
+
+        dynamoDb("ListTagsOfResource", "{\"ResourceArn\": \"" + tableArn + "\"}")
+            .statusCode(200)
+            .body("Tags.Value", contains("prod"));
+
+        continueUpdateRollback(stack, "Orders");
+        assertEquals("UPDATE_ROLLBACK_COMPLETE", CfnStackWaits.awaitTerminal(stack, CFN_AUTH).status());
+        dynamoDb("DeleteTable", "{\"TableName\": \"" + replacement + "\"}").statusCode(200);
+        deleteStack(stack);
+    }
+
     private ValidatableResponse describeStackEvents(String stack) {
         return given()
             .contentType("application/x-www-form-urlencoded")
@@ -314,6 +368,18 @@ class CloudFormationDynamoDbTimeToLiveIntegrationTest {
             .formParam("StackName", stack)
             .formParam("TemplateBody", template)
         .when().post("/").then().statusCode(200);
+    }
+
+    private void continueUpdateRollback(String stack, String... resourcesToSkip) {
+        RequestSpecification request = given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "ContinueUpdateRollback")
+            .formParam("StackName", stack);
+        for (int i = 0; i < resourcesToSkip.length; i++) {
+            request.formParam("ResourcesToSkip.member." + (i + 1), resourcesToSkip[i]);
+        }
+        request.when().post("/").then().statusCode(200);
     }
 
     private void deleteStack(String stack) {

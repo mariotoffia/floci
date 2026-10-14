@@ -11,6 +11,8 @@ import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import io.github.hectorvent.floci.services.dynamodb.backend.NativeDynamoDbBackend;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -65,6 +67,7 @@ class DynamoDbCfnProvisionerTest {
             return node == null ? null : node.asText();
         });
         when(engine.resolveNode(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(engine.resolveNodeOmittingNoValue(any())).thenAnswer(inv -> inv.getArgument(0));
         return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack");
     }
 
@@ -466,13 +469,35 @@ class DynamoDbCfnProvisionerTest {
         verifyNoInteractions(dynamoDb);
     }
 
+    /** As measured on AWS: a TTL block that is not an object fails model validation rather than reading as removed. */
+    @ParameterizedTest
+    @CsvSource({
+        "false, String",
+        "'\"invalid\"', String",
+        "'[{\"AttributeName\":\"expiresAt\",\"Enabled\":false}]', JSONArray"
+    })
+    void nonObjectTimeToLiveFailsModelValidationInsteadOfDisablingIt(String ttl, String found) throws Exception {
+        existingTable(withTimeToLive(table(false), "expiresAt"));
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+        r.setPhysicalId(TABLE_NAME);
+        JsonNode props = props("{\"TableName\":\"orders\",\"TimeToLiveSpecification\":" + ttl + "}");
+        ProvisionContext ctx = updateCtx(TABLE_NAME, TTL_PROPS);
+
+        AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx));
+
+        assertEquals("InvalidRequest", e.getErrorCode());
+        assertEquals("Model validation failed (#/TimeToLiveSpecification: expected type: JSONObject, found: "
+                + found + ")", e.getMessage());
+        verifyNoInteractions(dynamoDb);
+    }
+
     /** CloudFormation renames a TTL attribute by disabling it in one update and enabling the new one in a later one. */
     @Test
     void updateThatRenamesAnEnabledTimeToLiveAttributeFailsBeforeChangingAnything() throws Exception {
         existingTable(withTimeToLive(table(false), "expiresAt"));
         StackResource r = resource("AWS::DynamoDB::Table", "Orders");
         r.setPhysicalId(TABLE_NAME);
-        // Left by an earlier successful update; it must not make the engine skip its own restore.
+        // A stale snapshot, as a skipped rollback leaves; it must not make the engine skip its own restore.
         r.getAttributes().put(CfnRollback.DYNAMODB_TABLE_UPDATE_SNAPSHOT_ATTR, "{}");
         JsonNode props = props("{\"TableName\":\"orders\",\"Tags\":[{\"Key\":\"env\",\"Value\":\"prod\"}],"
                 + "\"TimeToLiveSpecification\":{\"AttributeName\":\"deleteAfter\",\"Enabled\":true}}");
@@ -710,6 +735,24 @@ class DynamoDbCfnProvisionerTest {
         assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
 
         assertTrue(r.getAttributes().containsKey(CfnRollback.DYNAMODB_TABLE_UPDATE_SNAPSHOT_ATTR));
+    }
+
+    /**
+     * A committed update is never rolled back, so its snapshot must not outlive the commit: a later
+     * failed update restores this resource, and a retried rollback would replay the stale snapshot.
+     */
+    @Test
+    void committedUpdateLeavesNoSnapshotToRollBackTo() throws Exception {
+        existingTable(table(false));
+        StackResource r = resource("AWS::DynamoDB::Table", "Orders");
+        r.setPhysicalId(TABLE_NAME);
+        provisioner.provision(r, props("{\"TableName\":\"orders\",\"Tags\":[{\"Key\":\"env\",\"Value\":\"prod\"}]}"),
+                updateCtx(TABLE_NAME));
+
+        UpdateCleanupResult cleanup = provisioner.completeUpdate(r);
+
+        assertFalse(cleanup.applicable());
+        assertFalse(provisioner.rollbackUpdate(r));
     }
 
     /**

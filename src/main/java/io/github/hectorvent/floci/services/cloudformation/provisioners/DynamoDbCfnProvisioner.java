@@ -123,8 +123,15 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
         // UpdateStack and re-pointed Ref at it.
         String tableName = ctx.stablePhysicalName(ctx.resolveOptional(props, "TableName"),
                 r.getLogicalId(), TABLE_NAME_MAX_LENGTH, false);
-        JsonNode ttlSpec = props != null ? engine.resolveNode(props.get("TimeToLiveSpecification")) : null;
-        boolean ttlDeclared = ttlSpec != null && ttlSpec.isObject();
+        JsonNode ttlSpec = props != null
+                ? engine.resolveNodeOmittingNoValue(props.get("TimeToLiveSpecification")) : null;
+        boolean ttlDeclared = ttlSpec != null && !ttlSpec.isMissingNode() && !ttlSpec.isNull();
+        if (ttlDeclared && !ttlSpec.isObject()) {
+            // As AWS reports it: scalars are typed String, so a boolean is "found: String" too.
+            throw new AwsException("InvalidRequest", "Model validation failed (#/TimeToLiveSpecification:"
+                    + " expected type: JSONObject, found: " + (ttlSpec.isArray() ? "JSONArray" : "String") + ")",
+                    400);
+        }
         // A stack that never declared TTL leaves it alone, as AWS does, so TTL set outside the stack
         // survives an update; removing a block the previous template declared turns TTL off.
         boolean ttlManaged = ttlDeclared || ctx.previouslyDeclared("TimeToLiveSpecification");
@@ -405,6 +412,17 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
     @Override
     public boolean retainsFailedUpdateState(StackResource resource) {
         return resource.getAttributes().containsKey(CfnRollback.DYNAMODB_TABLE_UPDATE_SNAPSHOT_ATTR);
+    }
+
+    /**
+     * The engine calls this for every resource once a stack update commits. A committed update is
+     * never rolled back, so its snapshot is dropped here: left on the resource, a later failed update
+     * would restore it and a retried rollback would put the table back to its state before this one.
+     */
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        resource.getAttributes().remove(CfnRollback.DYNAMODB_TABLE_UPDATE_SNAPSHOT_ATTR);
+        return UpdateCleanupResult.notApplicable();
     }
 
     /**
