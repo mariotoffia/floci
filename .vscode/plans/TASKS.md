@@ -1,0 +1,5 @@
+# Floci task list
+
+| ID | Status | Area | Task | Plan | Source |
+|---|---|---|---|---|---|
+| IOT-SHADOW-DEEP-MERGE | todo | iot (Device Shadow, REST JSON data plane + MQTT `$aws/things/.../shadow/update`) | UpdateThingShadow must deep-merge nested state (for example `state.reported.sensors`) like AWS IoT: merge objects key by key at every depth, `null` at any depth deletes that field and its metadata, arrays and scalars replace whole, metadata `timestamp` stamped per updated leaf only (untouched leaves keep their old timestamp), `version` increments by exactly 1 per accepted update, and `desired`/`reported`/`delta` computed from the merged document. | [shadow-deep-merge/plan.md](shadow-deep-merge/plan.md) | teos task 27.21 (shadow metadata timestamps), failing teos tests `TestProcessedPayloadFormatTypeSensorsFiltered` (`go-core/cbtarget/awsdstarget/target_integration_test.go:316`) and `TestAWSDsTargetProcessedPayloadFormatTypeSensorsFiltered` (`go-core/cbtarget/awsdstarget_integration_test.go:158`): `expected: float64(-14.1) actual: <nil>` |
