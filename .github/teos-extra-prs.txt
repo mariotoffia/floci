@@ -1,0 +1,4 @@
+# Pull requests by other authors that teos merges after floci-io/floci main and
+# mariotoffia's open pull requests, top to bottom. One per line: owner/repo#number
+# (floci-io/floci#N for one opened upstream), then why. Delete a line once
+# floci-io/floci main has the change.
