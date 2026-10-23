@@ -415,6 +415,9 @@ func TestIoT(t *testing.T) {
 			Topic: aws.String(topic), Payload: []byte("online"), Qos: 1, Retain: true,
 		})
 		require.NoError(t, err)
+		t.Cleanup(func() {
+			dataSvc.Publish(ctx, &iotdataplane.PublishInput{Topic: aws.String(topic), Retain: true})
+		})
 
 		// lastModifiedTime is epoch milliseconds; the delta tolerates clock skew to a containerised emulator.
 		retained, err := dataSvc.GetRetainedMessage(ctx, &iotdataplane.GetRetainedMessageInput{Topic: aws.String(topic)})
@@ -434,9 +437,6 @@ func TestIoT(t *testing.T) {
 			}
 		}
 		assert.Equal(t, retained.LastModifiedTime, listed)
-
-		_, err = dataSvc.Publish(ctx, &iotdataplane.PublishInput{Topic: aws.String(topic), Retain: true})
-		require.NoError(t, err)
 	})
 
 	t.Run("TopicRuleCrudAndRuleActions", func(t *testing.T) {
