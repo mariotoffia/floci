@@ -1,14 +1,19 @@
 package io.github.hectorvent.floci.services.iot;
 
 import io.quarkus.test.junit.QuarkusTest;
+import org.hamcrest.Matcher;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.hasKey;
+import static org.hamcrest.Matchers.isA;
+import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
 
@@ -113,6 +118,7 @@ class IotDataIntegrationTest {
 
     @Test
     void retainedMessagesRoundTripAndDeleteWithEmptyRetainedPublish() {
+        long publishedFrom = System.currentTimeMillis();
         given()
             .contentType("text/plain")
             .queryParam("retain", true)
@@ -122,6 +128,7 @@ class IotDataIntegrationTest {
             .post("/topics/devices/mvp1/retained")
         .then()
             .statusCode(200);
+        long publishedTo = System.currentTimeMillis();
 
         given()
         .when()
@@ -130,7 +137,16 @@ class IotDataIntegrationTest {
             .statusCode(200)
             .body("topic", equalTo("devices/mvp1/retained"))
             .body("payload", equalTo("cmV0YWluZWQtcGF5bG9hZA=="))
-            .body("qos", equalTo(1));
+            .body("qos", equalTo(1))
+            .body("lastModifiedTime", epochMillisBetween(publishedFrom, publishedTo));
+
+        given()
+        .when()
+            .get("/retainedMessage")
+        .then()
+            .statusCode(200)
+            .body("retainedTopics.find { it.topic == 'devices/mvp1/retained' }.lastModifiedTime",
+                    epochMillisBetween(publishedFrom, publishedTo));
 
         given()
             .contentType("text/plain")
@@ -331,5 +347,9 @@ class IotDataIntegrationTest {
             .body("metadata.reported.cfg.modes.size()", equalTo(1))
             .body("state.reported.tz", equalTo("Europe/Stockholm"))
             .body("version", equalTo(3));
+    }
+
+    private static Matcher<Long> epochMillisBetween(long from, long to) {
+        return allOf(isA(Long.class), greaterThanOrEqualTo(from), lessThanOrEqualTo(to));
     }
 }
