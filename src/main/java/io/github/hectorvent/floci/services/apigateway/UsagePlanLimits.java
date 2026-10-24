@@ -58,8 +58,8 @@ public final class UsagePlanLimits {
     }
 
     /**
-     * The stages, throttle and quota of a {@code CreateUsagePlan} request. Numbers may be JSON numbers
-     * or numeric strings.
+     * The stages, throttle and quota of a {@code CreateUsagePlan} request, the shape CloudFormation's
+     * provisioner builds too. Numbers may be JSON numbers or numeric strings.
      */
     public static Limits fromRequest(Map<String, Object> request) {
         requireJsonTypes(request);
