@@ -2948,6 +2948,10 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                     throw new AwsException("ServiceNotActiveException",
                             "Service " + serviceName + " is not active.", 400);
                 }
+                // Resolved before anything is applied: a request naming a task definition that cannot
+                // launch fails without changing the service.
+                TaskDefinition resolved = request.getTaskDefinition() == null ? null
+                        : resolveLaunchableTaskDefinition(request.getTaskDefinition(), region);
                 // Settle the outgoing deployment against the service as it stands, before this request
                 // changes its desired count or task definition: one whose tasks are up has finished,
                 // whether or not anything read it. recordServiceDeployment stops it if it has not.
@@ -3019,8 +3023,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 }
                 boolean taskDefChanged = false;
                 String platformVersionBefore = svc.getPlatformVersion();
-                if (request.getTaskDefinition() != null) {
-                    TaskDefinition resolved = resolveLaunchableTaskDefinition(request.getTaskDefinition(), region);
+                if (resolved != null) {
                     taskDefChanged = !resolved.getTaskDefinitionArn().equals(svc.getTaskDefinition());
                     svc.setTaskDefinition(resolved.getTaskDefinitionArn());
                     applyServicePlatform(svc, resolved, request.getPlatformVersion() != null
