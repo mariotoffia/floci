@@ -5054,6 +5054,69 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void aVpcAddressLeasedOutsideEc2SkipsAnAddressAnInterfaceHolds() {
+        RequestContext context = new RequestContext();
+        VpcNetworkManager vpcNetworks = mock(VpcNetworkManager.class);
+        Ec2Service service = mockedVpcNetworkService(context, Map.of(), vpcNetworks);
+        String subnetId = Ec2Service.defaultSubnetId("us-east-1", "a");
+        service.describeSubnets("us-east-1", List.of(), Map.of());
+        service.createNetworkInterface("us-east-1", subnetId, "holder", "172.31.0.10",
+                List.of(), List.of(), List.of());
+        when(vpcNetworks.allocatePrivateIp("us-east-1", subnetId))
+                .thenReturn(Optional.of("172.31.0.10"), Optional.of("172.31.0.11"));
+
+        assertEquals(Optional.of("172.31.0.11"), service.allocateVpcPrivateIp("us-east-1", subnetId));
+        verify(vpcNetworks).releasePrivateIp("us-east-1", subnetId, "172.31.0.10");
+    }
+
+    @Test
+    void anAddressAContainerLeasedIsInUseUntilItIsGivenBack() {
+        VpcNetworkManager vpcNetworks = mock(VpcNetworkManager.class);
+        Ec2Service service = mockedVpcNetworkService(new RequestContext(), Map.of(), vpcNetworks);
+        String subnetId = Ec2Service.defaultSubnetId("us-east-1", "a");
+        service.describeSubnets("us-east-1", List.of(), Map.of());
+        when(vpcNetworks.allocatePrivateIp("us-east-1", subnetId))
+                .thenReturn(Optional.of("172.31.0.10"), Optional.empty());
+        service.allocateVpcPrivateIp("us-east-1", subnetId);
+
+        AwsException inUse = assertThrows(AwsException.class, () -> service.createNetworkInterface("us-east-1",
+                subnetId, "named", "172.31.0.10", List.of(), List.of(), List.of()));
+        assertEquals("InvalidIPAddress.InUse", inUse.getErrorCode());
+        // The network's range is exhausted, so the address is synthesised.
+        assertEquals("172.31.0.11", service.createNetworkInterface("us-east-1", subnetId, "automatic", null,
+                List.of(), List.of(), List.of()).getPrivateIpAddress());
+
+        service.releaseVpcPrivateIp("us-east-1", subnetId, "172.31.0.10");
+        assertEquals("172.31.0.10", service.createNetworkInterface("us-east-1", subnetId, "named", "172.31.0.10",
+                List.of(), List.of(), List.of()).getPrivateIpAddress());
+    }
+
+    @Test
+    void anInterfaceEndpointCreatedAfterContainerLeasesTakesAnAddressNoContainerHolds() {
+        // Ten of a /28's eleven assignable addresses leased to containers, so whatever the endpoint
+        // id prefers, its interface must land on the one left over.
+        List<String> leased = new ArrayList<>();
+        for (int host = 4; host <= 13; host++) {
+            leased.add("10.50.1." + host);
+        }
+        MockedNetworkFixture fixture = mockedNetworkFixture("10.50.1.0/28", leased.toArray(String[]::new));
+        Ec2Service service = fixture.service();
+        for (int i = 0; i < leased.size(); i++) {
+            service.allocateVpcPrivateIp("us-east-1", fixture.subnetId());
+        }
+        String vpcId = service.describeSubnets("us-east-1", List.of(fixture.subnetId()), Map.of())
+                .getFirst().getVpcId();
+
+        service.createVpcEndpoint("us-east-1", vpcId, "com.amazonaws.us-east-1.ecs", "Interface", List.of(),
+                List.of(fixture.subnetId()), List.of(), null, null, List.of());
+
+        assertEquals("10.50.1.14", endpointAddressesBySubnet(service).get(fixture.subnetId()));
+        AwsException inUse = assertThrows(AwsException.class, () -> service.createNetworkInterface("us-east-1",
+                fixture.subnetId(), "named", "10.50.1.14", List.of(), List.of(), List.of()));
+        assertEquals("InvalidIPAddress.InUse", inUse.getErrorCode());
+    }
+
+    @Test
     void anAddressALaunchNamedWithoutLeasingItIsNotHandedOutAgain() {
         // A failed launch is marked terminated before its container is detached and its lease given
         // back. A launch that names the address in between finds nothing holding it and keeps it
