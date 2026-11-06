@@ -341,6 +341,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // region::subnetId → offset the next synthesised address is tried at. Only an ordering hint:
     // restart forgets it, and privateIpsInUse is what keeps addresses from being handed out twice.
     private final Map<String, Long> subnetIpCursors = new HashMap<>();
+    // region::subnetId → addresses allocateVpcPrivateIp leased to containers no stored resource
+    // stands behind; guarded by privateIpAllocationLock.
+    private final Map<String, Set<String>> containerPrivateIps = new HashMap<>();
     // Held from a synthesised address being chosen until the resource holding it is persisted, so
     // a concurrent allocation, which reads persisted resources to see what is taken, cannot pick
     // the same address in between. Taken after imageRegistryLock where a caller holds both.
@@ -409,6 +412,43 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             return vpcNetworkManager.attachContainer(region, vpcId, containerId);
         }
         return false;
+    }
+
+    /** Attaches a container to the VPC's Docker network at {@code address}; empty when it stays off it. */
+    public Optional<String> attachContainerToVpc(String region, String vpcId, String subnetId,
+                                                 String containerId, String address) {
+        if (vpcNetworkManager == null) {
+            return Optional.empty();
+        }
+        return vpcNetworkManager.attach(region, vpcId, subnetId, containerId, address);
+    }
+
+    /**
+     * Leases an address of a Docker-backed subnet that nothing else holds, as an instance's is
+     * chosen; empty when the subnet is not Docker-backed or has none left.
+     */
+    public Optional<String> allocateVpcPrivateIp(String region, String subnetId) {
+        if (vpcNetworkManager == null) {
+            return Optional.empty();
+        }
+        synchronized (privateIpAllocationLock) {
+            Optional<String> allocated = vpcNetworkManager.allocatePrivateIp(region, subnetId)
+                    .flatMap(first -> leaseNotHeld(region, subnetId, first,
+                            privateIpsHeldOnVpcNetwork(region, subnetId)));
+            allocated.ifPresent(address -> containerPrivateIps
+                    .computeIfAbsent(key(region, subnetId), ignored -> new HashSet<>()).add(address));
+            return allocated;
+        }
+    }
+
+    public void releaseVpcPrivateIp(String region, String subnetId, String address) {
+        synchronized (privateIpAllocationLock) {
+            containerPrivateIps.computeIfPresent(key(region, subnetId), (ignored, addresses) -> {
+                addresses.remove(address);
+                return addresses.isEmpty() ? null : addresses;
+            });
+            releasePrivateIps(region, subnetId, List.of(address));
+        }
     }
 
     public boolean isVpcNetworkEnabled() {
@@ -4545,6 +4585,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     /**
+     * Keeps the lease on {@code first}, or on the next address the network offers, unless
+     * {@code held} contains it. Callers must hold {@link #privateIpAllocationLock}.
+     */
+    private Optional<String> leaseNotHeld(String region, String subnetId, String first, Set<String> held) {
+        Optional<String> allocated = Optional.of(first);
+        List<String> skipped = new ArrayList<>();
+        while (allocated.isPresent() && held.contains(allocated.get())) {
+            skipped.add(allocated.get());
+            allocated = vpcNetworkManager.allocatePrivateIp(region, subnetId);
+        }
+        // Given back only once the walk is over, or the network would offer them again. Their
+        // holders took no lease, and deleting an interface returns none, so a lease kept here
+        // would outlive the holder.
+        releasePrivateIps(region, subnetId, skipped);
+        return allocated;
+    }
+
+    /**
      * Gives back the VPC network's lease on each address, so automatic allocation can offer it
      * again. Callers must hold {@link #privateIpAllocationLock}.
      */
@@ -4577,16 +4635,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             if (allocated.isPresent()) {
                 held = privateIpsHeldOnVpcNetwork(region, subnetId);
                 held.addAll(pending);
+                allocated = leaseNotHeld(region, subnetId, allocated.get(), held);
             }
-            List<String> skipped = new ArrayList<>();
-            while (allocated.isPresent() && held.contains(allocated.get())) {
-                skipped.add(allocated.get());
-                allocated = vpcNetworkManager.allocatePrivateIp(region, subnetId);
-            }
-            // Given back only once the walk is over, or the network would offer them again. Their
-            // holders took no lease, and deleting an interface returns none, so a lease kept here
-            // would outlive the holder.
-            releasePrivateIps(region, subnetId, skipped);
             if (allocated.isPresent()) {
                 return allocated.get();
             }
@@ -4749,7 +4799,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * Every private address a live instance, network interface, NAT gateway or EC2 Instance Connect
-     * Endpoint holds in the subnet.
+     * Endpoint holds in the subnet, and those {@link #allocateVpcPrivateIp} leased to containers.
      */
     private Set<String> privateIpsInUse(String region, String subnetId) {
         return new HashSet<>(privateIpsBySubnet(region).getOrDefault(subnetId, Set.of()));
@@ -4768,10 +4818,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     private Map<String, Set<String>> privateIpsBySubnet(String region) {
         String regionPrefix = region + "::";
-        return privateIpsBySubnet(networkInterfaces.scan(k -> k.startsWith(regionPrefix)),
+        Map<String, Set<String>> bySubnet = privateIpsBySubnet(networkInterfaces.scan(k -> k.startsWith(regionPrefix)),
                 instances.scan(k -> k.startsWith(regionPrefix)),
                 natGateways.scan(k -> k.startsWith(regionPrefix)),
                 instanceConnectEndpoints.scan(k -> k.startsWith(regionPrefix)));
+        // Read here, the one occupancy every allocator and endpoint derivation shares, so a derived
+        // endpoint interface cannot land on a container's address.
+        synchronized (privateIpAllocationLock) {
+            containerPrivateIps.forEach((subnetKey, addresses) -> {
+                if (subnetKey.startsWith(regionPrefix)) {
+                    bySubnet.computeIfAbsent(subnetKey.substring(regionPrefix.length()), ignored -> new HashSet<>())
+                            .addAll(addresses);
+                }
+            });
+        }
+        return bySubnet;
     }
 
     private static Map<String, Set<String>> privateIpsBySubnet(List<NetworkInterface> regionInterfaces,
@@ -7372,8 +7433,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * {@link #privateIpsInUse} as numeric IPv4 values, for endpoint derivation. Only persisted
-     * resources are read, never another endpoint's derived interfaces, so the derivation cannot
-     * recurse into itself through the allocator.
+     * resources and container leases are read, never another endpoint's derived interfaces, so the
+     * derivation cannot recurse into itself through the allocator.
      */
     private Set<Long> persistedAddressValuesInUse(String region, String subnetId) {
         return addressValues(privateIpsInUse(region, subnetId));
