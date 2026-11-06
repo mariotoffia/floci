@@ -1,0 +1,7 @@
+# Pull requests the open-PR query misses (other authors, or mariotoffia's closed ones
+# parked under upstream's 4-open-PR cap) that teos merges after floci-io/floci main and
+# mariotoffia's open pull requests, top to bottom. One per line: owner/repo#number
+# (floci-io/floci#N for one opened upstream), then why. Delete a line once
+# floci-io/floci main has the change, or once the PR is reopened (the open-PR query has it then).
+floci-io/floci#7668 closed under the 4-PR cap: ECR pulls from an address Docker Desktop reaches
+floci-io/floci#7673 closed under the 4-PR cap: ECS RunTask returns before image pulls
